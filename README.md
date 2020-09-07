@@ -15,3 +15,5 @@ These are all stored in an R-Markdown notebook, (request aditya.yow@gmail.com fo
 + In single-lane roads, the average speed of all cars on the road was increased by 10\% to 23\% and the percentage of stopped cars on average per iteration was decreased by 14\% to 65\%, after 5\% to 50\% of the vehicles were converted to AVs. 
 + In double-lane roads with no entries or exits, the average speed was increased by 5\% to 26\%, and the percentage of stopped cars was decreased by 25\% to 69\%, after 5\% to 50\% of the road was converted to AVs.
 + In double-lane road containing entries and exits, the average speed was increased by 24\% to 44\%, and the percentage of stopped cars was decreased by 20\% to 68\%, after 5\% to 50\% of the road was converted to AVs. 
+
+The various results visualized are also given in the Images folder.
