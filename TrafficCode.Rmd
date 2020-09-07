@@ -1,0 +1,3245 @@
+---
+title: "TrafficCode"
+author: "Aditya Maheshwari"
+date: "9/7/2020"
+output: html_document
+---
+
+This notebook gives all the code used to conduct traffic experiments. Single lane, double lane, etc are all separated for efficiency purposes.
+
+# Libraries Used
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+rm(list=ls()) # Clear Env
+library(dplyr) # Tables
+library(tidyr)
+library(parallel)
+library(ggplot2)
+library(gridExtra)
+library(xgboost)
+library(keras)
+```
+
+# Infrastructure Code Single Lane Roads
+
+```{r}
+# Builds Single Lane Road
+buildRoad <- function(roadLen, lanes, maxSpeed, preference) {
+  road <- list()
+  for (l in 1:lanes) {
+    road[[l]] <- as_tibble(data.frame(place = 0:(roadLen-1), fG = 0, bG = 0, mS = maxSpeed[[l]], p = preference[[l]]))
+  }
+  road
+}
+# Builds cars
+buildCars <- function(roadLen, lanes, numCars, maxSpeed, types) {
+  type <- sample(c(0, -1, 1), numCars, replace = TRUE, prob = types)
+  places <- sort(sample(1:(roadLen*lanes), numCars)) # Randomly Select Initial Places With Uniform Sample
+  lanes <- ceiling(places/roadLen) # Split Into Lanes
+  places <- places %% roadLen # Split Into Places
+  speeds <- sample(1:maxSpeed, numCars, replace=TRUE) # Randomly Pick Speeds
+  as_tibble(data.frame(ID = 1:numCars, place = places, speed = speeds, lane = lanes, type = type)) %>% arrange(lanes, places)
+}
+# Sets up full experiment with roads and cars
+buildExperiment <- function(roadLen, lanes, maxSpeed, preference, numCars, types, exitRate, rpIter) {
+  # Road Stats
+  road <- buildRoad(roadLen, lanes, maxSpeed, preference)
+  road$c <- list(len = roadLen, lanes = lanes, mSp = max(unlist(maxSpeed)), nC = numCars, exit = exitRate, it = rpIter, 
+                 carDn = types, exits = which(preference[[1]] == -0.75) - 1, entries = which(preference[[1]] == -1) - 1)
+  # Car Stats
+  cars <- buildCars(roadLen, lanes, numCars, max(unlist(maxSpeed)), types)
+  cars <- as_tibble(cbind(cars, ef = pmax(0, rnorm(numCars, exitRate, exitRate))))
+  list(road = road, cars = cars)
+}
+# Method of updating single lane on each iteration
+updateLane <- function(lane, cars, rL) {
+  nC <- nrow(cars)
+  if (nC == 0) {
+    lane$fG <- rL
+    lane$bG <- rL
+  } else {
+    cars <- rbind(cars[nC,], cars, cars[1,]) # Pad dataframe with lead and lag car
+    carPl <- 1
+    for (x in 0:(rL-1)) {
+      carPl <- carPl + (x == cars$place[carPl + 1])
+      lane$fG[x+1] <- (cars$place[carPl + 1] - x) %% rL
+      lane$bG[x+1] <- (x - cars$place[carPl]) %% rL
+      lane$fG[x+1] <- (lane$fG[x+1] == 0)*rL + lane$fG[x+1] # only 1 car
+    }
+  }
+  lane
+}
+# Manages exits of cars
+exits <- function(exper) {
+  rmCars <- filter(exper$cars, lane == 1, place %in% exper$road$c$exits)
+  nR <- nrow(rmCars)
+  if (nR != 0) {
+    IDs <- sample(c(rep(0, nR), rmCars$ID), nR, prob = c(rmCars$ef, pmax(0, 1-rmCars$ef)))
+    exper$cars <- filter(exper$cars, !(lane == 1 & (place %in% exper$road$c$exits) & !(ID %in% IDs)))
+  }
+  exper
+}
+# Manages entry of cars
+entries <- function(exper, nCi) {
+  entries <- exper$road$c$entries[!(exper$road$c$entries %in% filter(exper$cars, lane == 1)$place)]
+  #print(entries)
+  n <- min(length(entries), round(rnorm(1, nCi - rnorm(1, 1, 0.05)*nrow(exper$cars), 0.1*(max(nCi - rnorm(1, 1, 0.05)*nrow(exper$cars), 0)))))
+  if (n > 1) {
+    exper$cars <- bind_rows(exper$cars, 
+                            data.frame(ID = (max(exper$cars$ID) + 1):(max(exper$cars$ID) + n), 
+                                       place = sample(entries, n), 
+                                       speed = sample(1:exper$road$c$mSp, n, replace = TRUE), 
+                                       lane = 1, 
+                                       type = sample(c(0, -1, 1), n, replace=TRUE, prob = exper$road$c$carDn), 
+                                       ef = pmax(0, rnorm(n, exper$road$c$exit, exper$road$c$exit)))) %>% arrange(lane, place)
+    exper
+  } else if (n == 1) {
+    exper$cars <- bind_rows(exper$cars, 
+                            data.frame(ID = (max(exper$cars$ID) + 1), 
+                                       place = entries[1], 
+                                       speed = sample(1:exper$road$c$mSp, n, replace = TRUE), 
+                                       lane = 1, 
+                                       type = sample(c(0, -1, 1), n, replace=TRUE, prob = exper$road$c$carDn), 
+                                       ef = pmax(0, rnorm(n, exper$road$c$exit, exper$road$c$exit)))) %>% arrange(lane, place)
+    exper
+  } else {
+    exper
+  }
+}
+# Function that updates whole road on each iteration
+updateRoad <- function(exper) {
+  for (l in 1:exper$road$c$lanes) {
+    exper$road[[l]] <- updateLane(exper$road[[l]], exper$cars %>% filter(lane == l), exper$road$c$len)
+  }
+  exper
+}
+
+# Criteria tracked on each iteration (single lane)
+getStatsSL <- function(cars, rDen) {
+  cars %>% 
+    summarise(nC = n(),
+              optSp = mean(speed == rDen) %>% replace_na(0),
+              noSp = mean(speed == 0) %>% replace_na(0),
+              avgSp = mean(speed) %>% replace_na(0),
+              jam = mean(speed < rDen) %>% replace_na(0),
+              gJam = mean(diff(which(diff(place) < rDen), lag = 5) == 5, na.rm = TRUE) %>% replace_na(0),
+              agg = mean(speed > rDen) %>% replace_na(0),
+              aggG = mean(diff(which(diff(place) > rDen), lag = 2) == 2) %>% replace_na(0))
+}
+# Choose speed
+pickSpeedSV <- function(gap, speed, type) {
+  if (speed > gap) {
+    (type == 0) * sample(rep(seq(0, gap, 1), 2), 1, prob = rep(seq(1, gap+1, 1), 2)) + 
+      (type == 1) * sample(c(0, max(0, gap-1), gap), 1, prob = c(speed - gap, speed/2, speed/2)) + 
+      (type == -1) * sample(c(0, min(gap, 1), max(0, gap-1)), 1, prob = c(speed - gap, speed - gap + 1, gap))
+  } else if (speed == gap) {
+    speed
+  } else {
+    (type == 0) * sample(rep(seq(speed, gap, 1), 2), 1, prob = rep(c(speed, seq(gap, speed+1)), 2)) + 
+      (type == 1) * sample(rep(seq(speed, gap, 1), 2), 1, prob = rep(seq(speed, gap), 2)) + 
+      (type == -1) * sample(c(speed, min(speed+1, gap)), 1, prob = c(1, gap - speed + 1))
+  }
+}
+```
+
+# Infrastructure Code Double Lane Roads
+
+```{r}
+#Criteria tracked on each iteration (double lane)
+getStatsDL <- function(cars, rDen) {
+  cars %>% 
+    summarise(nC = n(),
+              optSp = mean(speed == rDen) %>% replace_na(0),
+              noSp = mean(speed == 0) %>% replace_na(0),
+              avgSp = mean(speed) %>% replace_na(0),
+              jam = mean(speed < rDen) %>% replace_na(0),
+              gJam = mean(diff(which(diff(place) < rDen), lag = 5) == 5, na.rm = TRUE) %>% replace_na(0),
+              agg = mean(speed > rDen) %>% replace_na(0),
+              aggG = mean(diff(which(diff(place) > rDen), lag = 2) == 2) %>% replace_na(0),
+              l1p = mean(lane == 1))
+}
+# Pick lane to travel on on each iteration for a single car
+pickLaneDL <- function(cL, oL, mSp, car) {
+  fG <- min(cL$fG + 1, cL$mS + 1, mSp + 1)
+  oGmin <- min(oL$fG, fG)
+  oG <- (oGmin > 1) * (car$speed < oGmin) * (mSp < oL$bG + car$speed) * (car$speed != 0)
+  
+  pickLane <- sample(c(which(car$lane != c(1, 2)), car$lane), 1, 
+                     prob = pmax(c(0, 0.01), 
+                                 c(oL$fG * oG, cL$fG*(1 + (cL$fG >= mSp))) * 
+                                   (c(1, 1) + 
+                                      c((1 + (car$type < 1))*car$ef*(car$lane != 1), (0.5 + 0.5*(car$type < 1)*car$ef*(car$lane == 1))) + 
+                                      c(oL$p * (car$type < 1), cL$p * (1 + (car$type < 0)) * (car$type < 1)))))
+  c(pickLane, min(fG, (car$lane != pickLane)*oL$fG + (car$lane == pickLane)*cL$fG))
+}
+# Pick speed to travel at on each iteration in double lane 
+pickSpeed <- function(gap, speed, type) {
+  if (speed > gap) {
+    (type == 0) * sample(rep(seq(0, gap, 1), 2), 1, prob = rep(seq(1, gap+1, 1), 2)) + 
+      (type == 1) * sample(c(0, max(0, gap-1), gap), 1, prob = c(speed - gap, speed/2, speed/2)) + 
+      (type == -1) * sample(c(0, min(gap, 1), max(0, gap-1)), 1, prob = c(speed - gap, speed - gap + 1, gap))
+  } else if (speed == gap) {
+    speed
+  } else {
+    (type == 0) * sample(rep(seq(speed, gap, 1), 2), 1, prob = rep(c(speed, seq(gap, speed+1)), 2)) + 
+      (type == 1) * sample(rep(seq(speed, gap, 1), 2), 1, prob = rep(seq(speed, gap), 2)) + 
+      (type == -1) * sample(c(speed, min(speed+1, gap)), 1, prob = c(2, gap - speed + 1))
+  }
+}
+```
+
+# Rewards and Initial State Functions
+
+```{r}
+rSp <- function(exper, x) {
+  exper$cars$speed[x]
+}
+rSpShare <- function(exper, x) {
+  sum(exper$cars$speed[exper$cars$type == 2])
+}
+rGap <- function(exper, x) {
+  min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][(exper$cars$place[x] == 0)*100 + exper$cars$place[x],]$bG, exper$cars$speed[x])
+}
+rGapShare <- function(exper, x) {
+  sum(pmin(exper$road[[1]][exper$cars$place[exper$cars$type == 2] + 1,]$fG, exper$road[[1]][(exper$cars$place[exper$cars$type == 2] == 0)*100 + exper$cars$place[exper$cars$type == 2],]$bG, exper$cars$speed[exper$cars$type == 2]))
+}
+rSpDiff <- function(exper, x, r) {
+  exper$cars$speed[x] - abs(exper$cars$speed[x] - exper$avParams$sharedTable$replayBuffer$sp1[r])
+}
+stfG <- function(exper, x) {
+  min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1, 6)
+}
+stfGbG <- function(exper, x) {
+  min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1, exper$road[[1]][(exper$cars$place[x] == 0)*100 + exper$cars$place[x],]$bG + 1, 6)
+}
+stfG2L <- function(exper, x) {
+  6*(min(exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$mS+1, 6) - 1) +
+    min(exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,]$fG, 6)
+}
+``` 
+
+```{r}
+qFn0 <- function(state, action) {
+  1
+}
+qFn1 <- function(state, action) {
+  #sum(state - action)
+  min(state, 12)/12
+}
+qFn2 <- function(state, action) {
+  action/5
+}
+qFn2p <- function(state, action) {
+  (action/5)^2
+}
+qFn3 <- function(state, action) {
+  (min(state, 12) - action)/12
+}
+qFn32 <- function(state, action) {
+  ((min(state, 12) - action)/12)^2
+}
+qFn33 <- function(state, action) {
+  ((min(state, 12) - action)/12)^3
+}
+qFn4 <- function(state, action) {
+  state*action/30
+}
+qFn5a <- function(state, action) {
+  state/36
+}
+qFn5b <- function(state, action) {
+  action/10
+}
+qFn5c <- function(state, action) {
+  state*action/(36*10)
+}
+qFn5d <- function(state, action) {
+  action > 5
+}
+```
+
+# DQN SL Infrastructure
+
+## Individual Approximate Q Learning
+
+```{r}
+getQVal <- function(qFns, state, action, weights) {
+  sum(weights * unlist(lapply(qFns, function(x) x(state, action))))
+}
+
+maxQ <- function(qFns, newState, actions, weights, eps) {
+  act <- unlist(lapply(actions, function(i) getQVal(qFns, newState, i, weights)))
+  list(action = sample(c(actions[which.max(act)], actions), 1, prob=c(1-eps, rep(eps, length(actions)))), value = max(act))
+}
+
+linQUpdate <- function(maxQVal, oldQVal, newReward, grad, elig, weights, gamma, lambda, alpha) {
+  delta <- newReward + gamma*maxQVal - oldQVal
+  elig <- gamma*lambda*elig + grad
+  weights <- weights + alpha*delta*elig
+  list(weights=weights, elig=elig)
+}
+```
+
+```{r}
+initAV <- function(exper, stFns, rFn, qFns, actions, def=6, dL=0.999, dE=0.999, dG = 0.9, alpha=0.8, eps=0.2, lambda=0.2, gamma=0.8, nAVs=c(1, 5)) {
+  avParams <- list()
+  nCs <- length(nAVs)
+  for (i in 1:nCs) {
+    table <- list(targetWeights = rep(1, length(qFns)),
+                  outputWeights = rep(1, length(qFns)),
+                  elig = rep(0, length(qFns)),
+                  replayBuffer = as_tibble(data.frame(ID = exper$cars$ID[nAVs[i]], 
+                                                       place = exper$cars$place[nAVs[i]], 
+                                                       speed = 0, fG = 1, bG = 1)),
+                  action = actions[1],
+                  state = rep(def, length(stFns)))
+    avParams[[i]] <- table
+    exper$cars$type[nAVs[i]] <- 2
+    exper$cars$ef[nAVs[i]] <- 0
+  }
+  names(avParams) <- paste0("c", exper$cars$ID[nAVs])
+  
+  avParams$sharedTable <- list(targetWeights = rep(1, length(qFns)),
+                               outputWeights = rep(1, length(qFns)),
+                               elig = rep(0, length(qFns)),
+                               replayBuffer = as_tibble(data.frame(ID = exper$cars$ID[nAVs[1]], 
+                                                                    place = exper$cars$place[nAVs[1]], 
+                                                                    speed = 0, fG = 1, bG = 1)))
+  
+  avParams$sharedParams <- list(stateList = stFns, rewardFn = rFn, qFns = qFns, actions = actions, dL = dL, dE = dE, dG = dG, alpha = alpha, eps = eps, lambda = lambda, gamma = gamma)
+  
+  exper$avParams <- avParams
+  exper
+}
+
+fullUpdateSL <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <-  exper %>% updateRoad %>% updateCarsSL
+    rStats <- getStatsSL(cars = exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars)))
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  
+  for (i in 1:iters) {
+    pC <- exper$cars
+    exper <- exper %>% updateRoad %>% updateCarsSL
+    rStats <- bind_rows(rStats, cbind(getStatsSL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+
+updateCarsSL <- function(exper) {
+  nC <- nrow(exper$cars)
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      newSt <- unlist(lapply(exper$avParams$sharedParams$stateList, function(stfi) stfi(exper, x)))
+      
+      exper$avParams[[paste0("c", exper$cars$ID[x])]]$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], exper$cars$speed[x],
+                                                                              exper$road[[1]][exper$cars$place[x] + 1,]$fG,
+                                                                              exper$road[[1]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG),
+                                                                              exper$avParams[[paste0("c", exper$cars$ID[x])]]$replayBuffer)
+      
+      oldQVal <- getQVal(qFns = exper$avParams$sharedParams$qFns, 
+                         state = exper$avParams[[paste0("c", exper$cars$ID[x])]]$state, 
+                         action = exper$avParams[[paste0("c", exper$cars$ID[x])]]$action, 
+                         weights = exper$avParams[[paste0("c", exper$cars$ID[x])]]$outputWeights)
+      
+      grad <- unlist(lapply(exper$avParams$sharedParams$qFns, 
+                            function(f) f(exper$avParams[[paste0("c", exper$cars$ID[x])]]$state, 
+                                          exper$avParams[[paste0("c", exper$cars$ID[x])]]$action)))
+      
+      maxQ <- maxQ(qFns = exper$avParams$sharedParams$qFns, 
+                   newState = newSt, 
+                   actions = exper$avParams$sharedParams$actions[exper$avParams$sharedParams$actions < min(exper$road[[1]][exper$cars$place[x] + 1,]$fG,
+                                                                                                           exper$road[[1]][exper$cars$place[x] + 1,]$mS+1)], 
+                   weights = exper$avParams[[paste0("c", exper$cars$ID[x])]]$outputWeights, 
+                   eps = exper$avParams$sharedParams$eps)
+      
+      updates <- linQUpdate(maxQVal = maxQ$value, oldQVal = oldQVal, grad = grad, 
+                            weights = exper$avParams[[paste0("c", exper$cars$ID[x])]]$outputWeights, 
+                            newReward = exper$avParams$sharedParams$rewardFn(exper, x), 
+                            elig = exper$avParams[[paste0("c", exper$cars$ID[x])]]$elig, 
+                            gamma = exper$avParams$sharedParams$gamma, 
+                            lambda = exper$avParams$sharedParams$lambda, 
+                            alpha = exper$avParams$sharedParams$alpha)
+      
+      exper$avParams[[paste0("c", exper$cars$ID[x])]]$outputWeights <- updates$weights
+      exper$avParams[[paste0("c", exper$cars$ID[x])]]$elig <- updates$elig
+      
+      exper$avParams[[paste0("c", exper$cars$ID[x])]]$action <- maxQ$action
+      exper$cars$speed[x] <- maxQ$action
+      
+      exper$avParams[[paste0("c", exper$cars$ID[x])]]$state <- newSt
+      
+    } else {
+      exper$cars$speed[x] <- pickSpeedSV(min(exper$road[[1]][exper$cars$place[x] + 1,]$fG - 1, exper$road[[1]][exper$cars$place[x] + 1,]$mS), exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+  
+  exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+  exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+  exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+    
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+```
+
+## Fully Shared Approximate Q Learning
+
+```{r}
+initAVShare <- function(exper, stFns, rFn, qFns, actions, def=6, dL=0.999, dE=0.999, dG = 0.9, alpha=0.8, eps=0.2, lambda=0.2, gamma=0.8, nAVs=c(1, 5), buffer = 400, replaceTarget = 20) {
+  avParams <- list()
+  nCs <- length(nAVs)
+  for (i in 1:nCs) {
+    exper$cars$type[nAVs[i]] <- 2
+    exper$cars$ef[nAVs[i]] <- 0
+  }
+  
+  avParams$sharedTable <- list(targetWeights = rep(1, length(qFns)),
+                               outputWeights = rep(1, length(qFns)),
+                               elig = rep(0, length(qFns)),
+                               action = actions[1],
+                               state = rep(def, length(stFns)),
+                               valPred = 0,
+                               replayBuffer = as_tibble(data.frame(ID = exper$cars$ID[nAVs[1]], 
+                                                                   place = exper$cars$place[nAVs[1]], 
+                                                                   vP = 0, rT = 0, typeF = 1,
+                                                                   ngap = 1, ngap1 = 1, ngap2 = 1, ngap3 = 1,
+                                                                   fG = 1, fG1 = 1, fG2 = 1, fG3 = 1,
+                                                                   bG = 1, bG1 = 1, bG2 = 1, bG3 = 1,
+                                                                   sp = 0, sp1 = 0, sp2 = 0, sp3 = 0)))
+  
+  avParams$sharedParams <- list(stateList = stFns, rewardFn = rFn, qFns = qFns, actions = actions, dL = dL, dE = dE, dG = dG, alpha = alpha, eps = eps, lambda = lambda, gamma = gamma, buffer = buffer, iters = replaceTarget, numAV = length(nAVs))
+  
+  for (i in 1:avParams$sharedParams$numAV) {
+    avParams$sharedTable$replayBuffer <- rbind(avParams$sharedTable$replayBuffer, avParams$sharedTable$replayBuffer)
+  }
+  
+  exper$avParams <- avParams
+  exper
+}
+
+updateCarsSLShare <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x), (exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[1]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[1]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r], exper$avParams$sharedTable$replayBuffer$sp3[r]),
+                                                       exper$avParams$sharedTable$replayBuffer)
+      
+      oldQVal <- getQVal(qFns = exper$avParams$sharedParams$qFns, 
+                         state = exper$avParams$sharedTable$state, 
+                         action = exper$avParams$sharedTable$action, 
+                         weights = exper$avParams$sharedTable$outputWeights)
+      grad <- unlist(lapply(exper$avParams$sharedParams$qFns, 
+                            function(f) f(exper$avParams$sharedTable$state, 
+                                          exper$avParams$sharedTable$action)))
+      mQ <- maxQ(qFns = exper$avParams$sharedParams$qFns, 
+                 newState = min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS + 1), 
+                 actions = exper$avParams$sharedParams$actions[exper$avParams$sharedParams$actions < min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1)], 
+                 weights = exper$avParams$sharedTable$targetWeights, 
+                 eps = exper$avParams$sharedParams$eps)
+      updates <- linQUpdate(maxQVal = mQ$value, oldQVal = oldQVal, grad = grad, 
+                            weights = exper$avParams$sharedTable$outputWeights, 
+                            newReward = sum(exper$cars$speed[exper$cars$type == 2])/(5*sum(exper$cars$type == 2)), 
+                            elig = exper$avParams$sharedTable$elig, 
+                            gamma = exper$avParams$sharedParams$gamma, 
+                            lambda = exper$avParams$sharedParams$lambda, 
+                            alpha = exper$avParams$sharedParams$alpha)
+      
+      exper$avParams$sharedTable$outputWeights <- updates$weights
+      exper$avParams$sharedTable$elig <- updates$elig
+      exper$cars$speed[x] <- mQ$action
+      exper$avParams$sharedTable$action <- mQ$action
+      exper$avParams$sharedTable$valPred <- mQ$value
+      exper$avParams$sharedTable$state <- min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1)
+      exper$avParams$sharedTable$replayBuffer[1, 3] <- mQ$value
+      
+    } else {
+      exper$cars$speed[x] <- pickSpeedSV(min(exper$road[[1]][exper$cars$place[x] + 1,]$fG - 1, exper$road[[1]][exper$cars$place[x] + 1,]$mS), exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+
+  exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+  exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+  exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+
+fullUpdateSLShare <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <-  exper %>% updateRoad %>% updateCarsSLShare %>% updateRoad
+    rStats <- getStatsSL(cars = exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars)))
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  
+  for (i in 1:iters) {
+    print(i)
+    if (i %% exper$avParams$sharedParams$iters == 5) {
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+    pC <- exper$cars
+    exper <- exper %>% updateCarsSLShare %>% updateRoad
+    rStats <- bind_rows(rStats, cbind(getStatsSL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+```
+
+## Regression-Based
+
+```{r}
+initAVReg <- function(exper, stFns, rFn, qFns, actions, def=6, dL=0.999, dE=0.999, dG = 0.9, alpha=0.8, eps=0.2, lambda=0.2, gamma=0.8, nAVs=c(1, 5), buffer = 400, replaceTarget = 20) {
+  avParams <- list()
+  nCs <- length(nAVs)
+  for (i in 1:nCs) {
+    exper$cars$type[nAVs[i]] <- 2
+    exper$cars$ef[nAVs[i]] <- 0
+  }
+  avParams$sharedTable <- list(targetWeights = rep(1, length(qFns)),
+                               outputWeights = rep(1, length(qFns)),
+                               elig = rep(0, length(qFns)),
+                               action = actions[1],
+                               state = rep(def, length(stFns)),
+                               valPred = 0,
+                               replayBuffer = as_tibble(data.frame(ID = exper$cars$ID[nAVs[1]], 
+                                                                   place = exper$cars$place[nAVs[1]], 
+                                                                   vP = 0, rT = 0, typeF = 1,
+                                                                   ngap = 1, ngap1 = 1, ngap2 = 1, ngap3 = 1,
+                                                                   fG = 1, fG1 = 1, fG2 = 1, fG3 = 1,
+                                                                   bG = 1, bG1 = 1, bG2 = 1, bG3 = 1,
+                                                                   sp = 0, sp1 = 0, sp2 = 0, sp3 = 0)))
+  avParams$sharedParams <- list(stateList = stFns, rewardFn = rFn, qFns = qFns, actions = actions, dL = dL, dE = dE, dG = dG, alpha = alpha, eps = eps, lambda = lambda, gamma = gamma, buffer = buffer, iters = replaceTarget, numAV = length(nAVs))
+  #for (i in 1:avParams$sharedParams$numAV) {
+  #  avParams$sharedTable$replayBuffer <- rbind(avParams$sharedTable$replayBuffer, avParams$sharedTable$replayBuffer)
+  #}
+  exper$avParams <- avParams
+  exper
+}
+
+buildModReg <- function(buffer) {
+  lm(yt ~ sp1 + typeF + ngap1 + ngap2 + ngap3 + fG1 + fG2 + fG3 + bG1 + bG2 + bG3 + sp1 + sp2 + sp3, buffer)$coefficients
+}
+
+updateCarsSLReg <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x), (exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[1]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[1]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r], exper$avParams$sharedTable$replayBuffer$sp3[r]), 
+                                                       exper$avParams$sharedTable$replayBuffer)
+
+      msp <- unlist(exper$avParams$sharedTable$replayBuffer[1, 6] - 1)
+      
+      # Select new action
+      qVals <- unlist(lapply(0:msp, function (a) sum(unlist(c(1, a, exper$avParams$sharedTable$replayBuffer[1, c(5, 6:8, 10:12, 14:16, 18, 19, 20)])) * exper$avParams$sharedTable$outputWeights)))
+      
+      mQA <- sample(c(which.max(qVals) - 1, 0:msp), 
+                    1, prob=c(1 - exper$avParams$sharedParams$eps, rep(exper$avParams$sharedParams$eps, msp + 1)))
+      
+      exper$cars$speed[x] <- mQA
+      exper$avParams$sharedTable$action <- mQA
+      exper$avParams$sharedTable$valPred <- max(qVals)
+      exper$avParams$sharedTable$replayBuffer[1, 3] <- max(qVals)
+
+      #gradient
+      #elig
+
+    } else {
+      exper$cars$speed[x] <- pickSpeedSV(min(exper$road[[1]][exper$cars$place[x] + 1,]$fG - 1, exper$road[[1]][exper$cars$place[x] + 1,]$mS), exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+  
+  bufferInd <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer)
+      
+  oldSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 21)]
+  newSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(5, 6:8, 10:12, 14:16, 18, 19, 20)]
+  rewardP <- exper$avParams$sharedTable$replayBuffer[bufferInd, 4]
+  
+  #Re-make Outputs on each iter
+  yt <- unname(rewardP + exper$avParams$sharedParams$gamma * 
+                 apply(cbind(cap=newSt[,6], as.matrix(cbind(int = 1, sp = 1, newSt)) %*% (matrix(rep(exper$avParams$sharedTable$targetWeights, 6), ncol=6) * matrix(c(rep(1, 6), 0:5, rep(1, 13*6)), ncol=6, byrow=TRUE))), 
+                             1, function(x) {
+                               max(x[2:(min(7, 2+x[1]))])}))
+  #print(yt)
+  exper$avParams$sharedTable$outputWeights <- replace_na(buildModReg(data.frame(yt = yt, oldSt)), 0)
+  
+  exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+  exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+  exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+
+fullUpdateSLReg <- function(exper, iters, new = FALSE, buildbuffer = TRUE, table = NULL) {
+  if (new & buildbuffer) {
+    exper <- fullUpdateSLShare(exper, 100, TRUE)
+    print("hi")
+    rStats <- exper$rStats
+    exper <- exper$exper
+    exper$avParams$sharedTable$targetWeights = replace_na(buildModReg(sample_n(cbind(yt = exper$avParams$sharedTable$replayBuffer$vP, exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer)), 0)
+    exper$avParams$sharedTable$outputWeights = replace_na(buildModReg(sample_n(cbind(yt = exper$avParams$sharedTable$replayBuffer$vP, exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer)), 0)
+    exper$avParams$sharedTable$elig = rep(0, 12)
+    exper$avParams$sharedTable$replayBuffer = sample_n(exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3)), 250, replace=TRUE)
+  } else if (new & !buildbuffer) {
+    exper <- fullUpdateSLShare(exper, 4, TRUE)
+    rStats <- exper$rStats
+    exper <- exper$exper
+    exper$avParams$sharedTable$replayBuffer = bind_rows(exper$avParams$sharedTable$replayBuffer[1:(4*sum(exper$cars$type == 2)),], table)
+    exper$avParams$sharedTable$targetWeights = replace_na(buildModReg(sample_n(cbind(yt = exper$avParams$sharedTable$replayBuffer$vP, exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer)), 0)
+    exper$avParams$sharedTable$outputWeights = replace_na(buildModReg(sample_n(cbind(yt = exper$avParams$sharedTable$replayBuffer$vP, exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer)), 0)
+    exper <-  exper %>% updateRoad %>% updateCarsSLReg %>% updateRoad
+    rStats <- getStatsSL(cars = exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars)))
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  
+  for (i in 1:iters) {
+    print(i)
+    if (i %% exper$avParams$sharedParams$iters == 5) {
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+    #print(nrow(exper$avParams$sharedTable$replayBuffer))
+    #print(exper$avParams$sharedTable$targetWeights)
+    #print(exper$avParams$sharedTable$outputWeights)
+    pC <- exper$cars
+    exper <- exper %>% updateCarsSLReg %>% updateRoad
+    rStats <- bind_rows(rStats, cbind(getStatsSL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+```
+
+## XGBOOST
+
+```{r}
+initAVxg <- function(exper, stFns, rFn, qFns, actions, def=6, dL=0.999, dE=0.999, dG = 0.9, alpha=0.8, eps=0.2, lambda=0.2, gamma=0.8, nAVs=c(1, 5), buffer = 400, replaceTarget = 20, rounds = 50) {
+  avParams <- list()
+  nCs <- length(nAVs)
+  for (i in 1:nCs) {
+    exper$cars$type[nAVs[i]] <- 2
+    exper$cars$ef[nAVs[i]] <- 0
+  }
+  avParams$sharedTable <- list(targetWeights = rep(1, length(qFns)),
+                               outputWeights = rep(1, length(qFns)),
+                               elig = rep(0, length(qFns)),
+                               action = actions[1],
+                               state = rep(def, length(stFns)),
+                               valPred = 0,
+                               replayBuffer = as_tibble(data.frame(ID = exper$cars$ID[nAVs[1]], 
+                                                                   place = exper$cars$place[nAVs[1]], 
+                                                                   vP = 0, rT = 0, typeF = 1,
+                                                                   ngap = 1, ngap1 = 1, ngap2 = 1, ngap3 = 1,
+                                                                   fG = 1, fG1 = 1, fG2 = 1, fG3 = 1,
+                                                                   bG = 1, bG1 = 1, bG2 = 1, bG3 = 1,
+                                                                   sp1 = 0, sp2 = 0, sp3 = 0)))
+  avParams$sharedParams <- list(stateList = stFns, rewardFn = rFn, qFns = qFns, actions = actions, dL = dL, dE = dE, dG = dG, alpha = alpha, eps = eps, lambda = lambda, gamma = gamma, buffer = buffer, iters = replaceTarget, numAV = length(nAVs), rounds = rounds)
+#  for (i in 1:avParams$sharedParams$numAV) {
+#    avParams$sharedTable$replayBuffer <- rbind(avParams$sharedTable$replayBuffer, avParams$sharedTable$replayBuffer)
+#  }
+  exper$avParams <- avParams
+  exper
+}
+  
+updateCarsSLxg <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x), (exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[1]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[1]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r]), 
+                                                       exper$avParams$sharedTable$replayBuffer)
+
+      # Select new action
+      msp <- unlist(exper$avParams$sharedTable$replayBuffer[1, 6] - 1)
+      qVals <- unlist(lapply(0:msp, function (a) predict(exper$avParams$sharedTable$outputWeights, t(as.matrix(as.numeric(c(sp1 = a, exper$avParams$sharedTable$replayBuffer[1, c(5, 6:8, 10:12, 14:16, 18, 19)])))))))
+      mQA <- sample(c(which.max(qVals) - 1, 0:msp), 1, prob=c(1 - exper$avParams$sharedParams$eps, rep(exper$avParams$sharedParams$eps, msp + 1)))
+      
+      exper$cars$speed[x] <- mQA
+      exper$avParams$sharedTable$action <- mQA
+      exper$avParams$sharedTable$valPred <- max(qVals)
+      exper$avParams$sharedTable$replayBuffer[1, 3] <- max(qVals)
+    } else {
+      exper$cars$speed[x] <- pickSpeedSV(min(exper$road[[1]][exper$cars$place[x] + 1,]$fG - 1, exper$road[[1]][exper$cars$place[x] + 1,]$mS), exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+  
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+
+fullUpdateSLxg <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <- fullUpdateSLShare(exper, 100, TRUE)
+    rStats <- exper$rStats
+    exper <- exper$exper
+    
+    exper$avParams$sharedTable$replayBuffer <- exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3))
+    ind <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer, replace=TRUE)
+    
+    exper$avParams$sharedTable$outputWeights <- xgboost(data = as.matrix(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20)]), 
+                                                        label = exper$avParams$sharedTable$replayBuffer[ind,3]$vP, 
+                                                        nrounds = exper$avParams$sharedParams$rounds, objective = "reg:squarederror", verbose = FALSE)
+    exper$avParams$sharedTable$targetWeights  <- xgboost(data = as.matrix(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20)]), 
+                                                         label = exper$avParams$sharedTable$replayBuffer[ind,3]$vP, 
+                                                         nrounds = exper$avParams$sharedParams$rounds, objective = "reg:squarederror", verbose = FALSE)
+    exper$avParams$sharedTable$replayBuffer = sample_n(exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3)), 250, replace=TRUE)
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  
+  for (i in 1:iters) {
+    print(i)
+    if (i %% exper$avParams$sharedParams$iters == 5) {
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+
+    pC <- exper$cars
+    exper <- exper %>% updateCarsSLxg %>% updateRoad
+    
+    #if (i %% 20 == 0) {
+      bufferInd <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer)
+    
+      oldSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(18, 5, 7:9, 11:13, 15:17, 19, 20)]
+      newSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(5, 6:8, 10:12, 14:16, 18, 19)]
+      colnames(newSt) <- colnames(oldSt)[-c(1)]
+      rewardP <- exper$avParams$sharedTable$replayBuffer[bufferInd, 4]
+
+      #Re-make Outputs on each iter
+      yt <- rewardP + exper$avParams$sharedParams$gamma * apply(do.call(cbind, lapply(0:5, function(sp) predict(exper$avParams$sharedTable$targetWeights, as.matrix(cbind(sp1 = pmin(sp, newSt[,2]-1), newSt))))), 1, max)
+      #print("training")
+      exper$avParams$sharedTable$outputWeights <- xgboost(data = as.matrix(oldSt), label = yt$rT, nrounds = exper$avParams$sharedParams$rounds, objective = "reg:squarederror", verbose = FALSE)
+    #}
+    
+    exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+    exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+    exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+
+    rStats <- bind_rows(rStats, cbind(getStatsSL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+```
+
+## NN Keras
+
+```{r}
+updateCarsSLShare <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x), (exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[1]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[1]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r], exper$avParams$sharedTable$replayBuffer$sp3[r]),
+                                                       exper$avParams$sharedTable$replayBuffer)
+      
+      oldQVal <- getQVal(qFns = exper$avParams$sharedParams$qFns, 
+                         state = exper$avParams$sharedTable$state, 
+                         action = exper$avParams$sharedTable$action, 
+                         weights = exper$avParams$sharedTable$outputWeights)
+      grad <- unlist(lapply(exper$avParams$sharedParams$qFns, 
+                            function(f) f(exper$avParams$sharedTable$state, 
+                                          exper$avParams$sharedTable$action)))
+      mQ <- maxQ(qFns = exper$avParams$sharedParams$qFns, 
+                 newState = min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS + 1), 
+                 actions = exper$avParams$sharedParams$actions[exper$avParams$sharedParams$actions < min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1)], 
+                 weights = exper$avParams$sharedTable$targetWeights, 
+                 eps = exper$avParams$sharedParams$eps)
+      updates <- linQUpdate(maxQVal = mQ$value, oldQVal = oldQVal, grad = grad, 
+                            weights = exper$avParams$sharedTable$outputWeights, 
+                            newReward = sum(exper$cars$speed[exper$cars$type == 2])/(5*sum(exper$cars$type == 2)), 
+                            elig = exper$avParams$sharedTable$elig, 
+                            gamma = exper$avParams$sharedParams$gamma, 
+                            lambda = exper$avParams$sharedParams$lambda, 
+                            alpha = exper$avParams$sharedParams$alpha)
+      
+      exper$avParams$sharedTable$outputWeights <- updates$weights
+      exper$avParams$sharedTable$elig <- updates$elig
+      exper$cars$speed[x] <- mQ$action
+      exper$avParams$sharedTable$action <- mQ$action
+      exper$avParams$sharedTable$valPred <- mQ$value
+      exper$avParams$sharedTable$state <- min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1)
+      exper$avParams$sharedTable$replayBuffer[1, 3] <- mQ$value
+      
+    } else {
+      exper$cars$speed[x] <- pickSpeedSV(min(exper$road[[1]][exper$cars$place[x] + 1,]$fG - 1, exper$road[[1]][exper$cars$place[x] + 1,]$mS), exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+
+  exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+  exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+  exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+
+fullUpdateSLShare <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <-  exper %>% updateRoad %>% updateCarsSLShare %>% updateRoad
+    rStats <- getStatsSL(cars = exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars)))
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  
+  for (i in 1:iters) {
+    print(i)
+    if (i %% exper$avParams$sharedParams$iters == 5) {
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+    pC <- exper$cars
+    exper <- exper %>% updateCarsSLShare %>% updateRoad
+    rStats <- bind_rows(rStats, cbind(getStatsSL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+
+initAVnn <- function(exper, stFns, rFn, qFns, actions, def=6, dL=0.999, dE=0.999, dG = 0.9, alpha=0.8, eps=0.2, lambda=0.2, gamma=0.8, nAVs=c(1, 5), buffer = 400, replaceTarget = 20, rounds = 50) {
+  avParams <- list()
+  nCs <- length(nAVs)
+  for (i in 1:nCs) {
+    exper$cars$type[nAVs[i]] <- 2
+    exper$cars$ef[nAVs[i]] <- 0
+  }
+  avParams$sharedTable <- list(targetWeights = rep(1, length(qFns)),
+                               outputWeights = rep(1, length(qFns)),
+                               elig = rep(0, length(qFns)),
+                               action = actions[1],
+                               state = rep(def, length(stFns)),
+                               valPred = 0,
+                               replayBuffer = as_tibble(data.frame(ID = exper$cars$ID[nAVs[1]], 
+                                                                   place = exper$cars$place[nAVs[1]], 
+                                                                   vP = 0, rT = 0, typeF = 1,
+                                                                   ngap = 1, ngap1 = 1, ngap2 = 1, ngap3 = 1,
+                                                                   fG = 1, fG1 = 1, fG2 = 1, fG3 = 1,
+                                                                   bG = 1, bG1 = 1, bG2 = 1, bG3 = 1,
+                                                                   sp = 0, sp1 = 0, sp2 = 0, sp3 = 0)))
+  avParams$sharedParams <- list(stateList = stFns, rewardFn = rFn, qFns = qFns, actions = actions, dL = dL, dE = dE, dG = dG, alpha = alpha, eps = eps, lambda = lambda, gamma = gamma, buffer = buffer, iters = replaceTarget, numAV = length(nAVs), rounds = rounds)
+#  for (i in 1:avParams$sharedParams$numAV) {
+#    avParams$sharedTable$replayBuffer <- rbind(avParams$sharedTable$replayBuffer, avParams$sharedTable$replayBuffer)
+#  }
+  exper$avParams <- avParams
+  exper
+}
+  
+updateCarsSLnn <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x), (exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[1]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[1]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r], exper$avParams$sharedTable$replayBuffer$sp3[r]), 
+                                                       exper$avParams$sharedTable$replayBuffer)
+
+      # Select new action
+      msp <- unlist(exper$avParams$sharedTable$replayBuffer$ngap[1] - 1)
+      qVals <- unlist(lapply(0:msp, function (a) 
+        predict(exper$avParams$sharedTable$outputWeights, as.matrix(cbind(sp1 = a, exper$avParams$sharedTable$replayBuffer[1, c(5, 6:8, 10:12, 14:16, 18, 19, 20)]), nrow=1)) %>% as.vector()))
+      mQA <- sample(c(which.max(qVals) - 1, 0:msp), 1, prob=c(1 - exper$avParams$sharedParams$eps, rep(exper$avParams$sharedParams$eps, msp + 1)))
+      
+      exper$cars$speed[x] <- mQA
+      exper$avParams$sharedTable$action <- mQA
+      exper$avParams$sharedTable$valPred <- max(qVals)
+      exper$avParams$sharedTable$replayBuffer[1, 3] <- max(qVals)
+    } else {
+      exper$cars$speed[x] <- pickSpeedSV(min(exper$road[[1]][exper$cars$place[x] + 1,]$fG - 1, exper$road[[1]][exper$cars$place[x] + 1,]$mS), exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+  
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+
+fullUpdateSLnn <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <- fullUpdateSLShare(exper, 100, TRUE)
+    rStats <- exper$rStats
+    exper <- exper$exper
+    exper$avParams$sharedTable$outputWeights <- keras_model_sequential()
+    exper$avParams$sharedTable$outputWeights %>% 
+      layer_dense(units = 32, activation = 'relu', input_shape = c(14)) %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 32, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 32, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 16, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 1, activation = 'linear') %>% 
+      compile(optimizer = 'adam', loss = 'mse')#, metrics = list('mae'))
+    
+    exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    exper$avParams$sharedTable$replayBuffer <- exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3))
+    ind <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer, replace=TRUE)
+    
+    exper$avParams$sharedTable$outputWeights %>% 
+      fit(matrix(unlist(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 21)]), ncol=14),
+          matrix(exper$avParams$sharedTable$replayBuffer$vP[ind], ncol=1),
+          epochs = 10, batch_size = 32, view_metrics = FALSE, verbose = 0)
+    exper$avParams$sharedTable$targetWeights %>% 
+      fit(matrix(unlist(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 21)]), ncol=14),
+          matrix(exper$avParams$sharedTable$replayBuffer$vP[ind], ncol=1),
+          epochs = 10, batch_size = 32, view_metrics = FALSE, verbose = 0)
+    
+    exper$avParams$sharedTable$replayBuffer <- sample_n(exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3)), exper$avParams$sharedTable$replayBuffer*4, replace=TRUE)
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  
+  for (i in 1:iters) {
+    if (i %% exper$avParams$sharedParams$iters == 1) {
+      print(i)
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+
+    pC <- exper$cars
+    exper <- exper %>% updateCarsSLnn %>% updateRoad
+    
+    #if (i %% 5 == 1) {
+      bufferInd <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer)
+      oldSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 21)]
+      newSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(5, 6:8, 10:12, 14:16, 18, 19, 20)]
+      rewardP <- exper$avParams$sharedTable$replayBuffer$rT[bufferInd]
+      #Re-make Outputs on each iter
+      yt <- rewardP + exper$avParams$sharedParams$gamma * apply(do.call(cbind, lapply(0:5, function(sp) as.vector(predict(exper$avParams$sharedTable$targetWeights, as.matrix(cbind(sp1 = pmin(sp, newSt$ngap-1), newSt)))))), 1, max)
+      
+      exper$avParams$sharedTable$outputWeights %>% 
+        fit(matrix(unlist(oldSt), ncol=14), matrix(yt, ncol=1),
+            epochs = 10, batch_size = 100, view_metrics = FALSE, verbose = 0)
+    #}
+    
+    exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+    exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+    exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+
+    rStats <- bind_rows(rStats, cbind(getStatsSL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+```
+
+
+# NN SL
+
+## Libraries
+
+```{r}
+rm(list=ls()) # Clear Env
+library(dplyr) # Tables
+library(tidyr)
+library(parallel)
+library(ggplot2)
+library(gridExtra)
+library(xgboost)
+library(keras)
+```
+
+## Infrastructure Code
+
+```{r}
+buildRoad <- function(roadLen, lanes, maxSpeed, preference) {
+  road <- list()
+  for (l in 1:lanes) {
+    road[[l]] <- as_tibble(data.frame(place = 0:(roadLen-1), fG = 0, bG = 0, mS = maxSpeed[[l]], p = preference[[l]]))
+  }
+  road
+}
+buildCars <- function(roadLen, lanes, numCars, maxSpeed, types) {
+  type <- sample(c(0, -1, 1), numCars, replace = TRUE, prob = types)
+  places <- sort(sample(1:(roadLen*lanes), numCars)) # Randomly Select Initial Places With Uniform Sample
+  lanes <- ceiling(places/roadLen) # Split Into Lanes
+  places <- places %% roadLen # Split Into Places
+  speeds <- sample(1:maxSpeed, numCars, replace=TRUE) # Randomly Pick Speeds
+  as_tibble(data.frame(ID = 1:numCars, place = places, speed = speeds, lane = lanes, type = type)) %>% arrange(lanes, places)
+}
+buildExperiment <- function(roadLen, lanes, maxSpeed, preference, numCars, types, exitRate, rpIter) {
+  # Road Stats
+  road <- buildRoad(roadLen, lanes, maxSpeed, preference)
+  road$c <- list(len = roadLen, lanes = lanes, mSp = max(unlist(maxSpeed)), nC = numCars, exit = exitRate, it = rpIter, 
+                 carDn = types, exits = which(preference[[1]] == -0.75) - 1, entries = which(preference[[1]] == -1) - 1)
+  # Car Stats
+  cars <- buildCars(roadLen, lanes, numCars, max(unlist(maxSpeed)), types)
+  cars <- as_tibble(cbind(cars, ef = pmax(0, rnorm(numCars, exitRate, exitRate))))
+  list(road = road, cars = cars)
+}
+updateLane <- function(lane, cars, rL) {
+  nC <- nrow(cars)
+  if (nC == 0) {
+    lane$fG <- rL
+    lane$bG <- rL
+  } else {
+    cars <- rbind(cars[nC,], cars, cars[1,]) # Pad dataframe with lead and lag car
+    carPl <- 1
+    for (x in 0:(rL-1)) {
+      carPl <- carPl + (x == cars$place[carPl + 1])
+      lane$fG[x+1] <- (cars$place[carPl + 1] - x) %% rL
+      lane$bG[x+1] <- (x - cars$place[carPl]) %% rL
+      lane$fG[x+1] <- (lane$fG[x+1] == 0)*rL + lane$fG[x+1] # only 1 car
+    }
+  }
+  lane
+}
+exits <- function(exper) {
+  rmCars <- filter(exper$cars, lane == 1, place %in% exper$road$c$exits)
+  nR <- nrow(rmCars)
+  if (nR != 0) {
+    IDs <- sample(c(rep(0, nR), rmCars$ID), nR, prob = c(rmCars$ef, pmax(0, 1-rmCars$ef)))
+    exper$cars <- filter(exper$cars, !(lane == 1 & (place %in% exper$road$c$exits) & !(ID %in% IDs)))
+  }
+  exper
+}
+entries <- function(exper, nCi) {
+  entries <- exper$road$c$entries[!(exper$road$c$entries %in% filter(exper$cars, lane == 1)$place)]
+  #print(entries)
+  n <- min(length(entries), round(rnorm(1, nCi - rnorm(1, 1, 0.05)*nrow(exper$cars), 0.1*(max(nCi - rnorm(1, 1, 0.05)*nrow(exper$cars), 0)))))
+  if (n > 1) {
+    exper$cars <- bind_rows(exper$cars, 
+                            data.frame(ID = (max(exper$cars$ID) + 1):(max(exper$cars$ID) + n), 
+                                       place = sample(entries, n), 
+                                       speed = sample(1:exper$road$c$mSp, n, replace = TRUE), 
+                                       lane = 1, 
+                                       type = sample(c(0, -1, 1), n, replace=TRUE, prob = exper$road$c$carDn), 
+                                       ef = pmax(0, rnorm(n, exper$road$c$exit, exper$road$c$exit)))) %>% arrange(lane, place)
+    exper
+  } else if (n == 1) {
+    exper$cars <- bind_rows(exper$cars, 
+                            data.frame(ID = (max(exper$cars$ID) + 1), 
+                                       place = entries[1], 
+                                       speed = sample(1:exper$road$c$mSp, n, replace = TRUE), 
+                                       lane = 1, 
+                                       type = sample(c(0, -1, 1), n, replace=TRUE, prob = exper$road$c$carDn), 
+                                       ef = pmax(0, rnorm(n, exper$road$c$exit, exper$road$c$exit)))) %>% arrange(lane, place)
+    exper
+  } else {
+    exper
+  }
+}
+updateRoad <- function(exper) {
+  for (l in 1:exper$road$c$lanes) {
+    exper$road[[l]] <- updateLane(exper$road[[l]], exper$cars %>% filter(lane == l), exper$road$c$len)
+  }
+  exper
+}
+```
+
+## Single Lane Specific Updates
+
+```{r}
+getStatsSL <- function(cars, rDen) {
+  cars %>% 
+    summarise(nC = n(),
+              optSp = mean(speed == rDen) %>% replace_na(0),
+              noSp = mean(speed == 0) %>% replace_na(0),
+              avgSp = mean(speed) %>% replace_na(0),
+              jam = mean(speed < rDen) %>% replace_na(0),
+              gJam = mean(diff(which(diff(place) < rDen), lag = 5) == 5, na.rm = TRUE) %>% replace_na(0),
+              agg = mean(speed > rDen) %>% replace_na(0),
+              aggG = mean(diff(which(diff(place) > rDen), lag = 2) == 2) %>% replace_na(0))
+}
+pickSpeedSV <- function(gap, speed, type) {
+  if (speed > gap) {
+    (type == 0) * sample(rep(seq(0, gap, 1), 2), 1, prob = rep(seq(1, gap+1, 1), 2)) + 
+      (type == 1) * sample(c(0, max(0, gap-1), gap), 1, prob = c(speed - gap, speed/2, speed/2)) + 
+      (type == -1) * sample(c(0, min(gap, 1), max(0, gap-1)), 1, prob = c(speed - gap, speed - gap + 1, gap))
+  } else if (speed == gap) {
+    speed
+  } else {
+    (type == 0) * sample(rep(seq(speed, gap, 1), 2), 1, prob = rep(c(speed, seq(gap, speed+1)), 2)) + 
+      (type == 1) * sample(rep(seq(speed, gap, 1), 2), 1, prob = rep(seq(speed, gap), 2)) + 
+      (type == -1) * sample(c(speed, min(speed+1, gap)), 1, prob = c(1, gap - speed + 1))
+  }
+}
+```
+
+## Rewards and Initial States
+
+```{r}
+rFn1 <- function(exper, x) {
+  exper$cars$speed[x]/5
+}
+qFn0 <- function(state, action) {
+  1
+}
+qFn1 <- function(state, action) {
+  #sum(state - action)
+  min(state, 6)/6
+}
+qFn2 <- function(state, action) {
+  action/5
+}
+qFn2p <- function(state, action) {
+  (action/5)^2
+}
+
+rSp <- function(exper, x, r) {
+  exper$cars$speed[x]
+}
+rSpShare <- function(exper, x, r) {
+  sum(exper$cars$speed[exper$cars$type == 2])
+}
+rGap <- function(exper, x, r) {
+  min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][(exper$cars$place[x] == 0)*100 + exper$cars$place[x],]$bG, exper$cars$speed[x])
+}
+rGapShare <- function(exper, x, r) {
+  sum(pmin(exper$road[[1]][exper$cars$place[exper$cars$type == 2] + 1,]$fG, exper$road[[1]][(exper$cars$place[exper$cars$type == 2] == 0)*100 + exper$cars$place[exper$cars$type == 2],]$bG, exper$cars$speed[exper$cars$type == 2]))
+}
+rSpDiff <- function(exper, x, r) {
+  exper$cars$speed[x] - abs(exper$cars$speed[x] - exper$avParams$sharedTable$replayBuffer$sp1[r])
+}
+stfG <- function(exper, x, r) {
+  min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1, 6)
+}
+stfGbG <- function(exper, x, r) {
+  min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1, exper$road[[1]][(exper$cars$place[x] == 0)*100 + exper$cars$place[x],]$bG + 1, 6)
+}
+```
+
+## Approximate Q Learning Reward and Base Q Fns
+
+```{r}
+getQVal <- function(qFns, state, action, weights) {
+  sum(weights * unlist(lapply(qFns, function(x) x(state, action))))
+}
+maxQ <- function(qFns, newState, actions, weights, eps) {
+  act <- unlist(lapply(actions, function(i) getQVal(qFns, newState, i, weights)))
+  list(action = sample(c(actions[which.max(act)], actions), 1, prob=c(1-eps, rep(eps, length(actions)))), value = max(act))
+}
+linQUpdate <- function(maxQVal, oldQVal, newReward, grad, elig, weights, gamma, lambda, alpha) {
+  delta <- newReward + gamma*maxQVal - oldQVal
+  elig <- gamma*lambda*elig + grad
+  weights <- weights + alpha*delta*elig
+  list(weights=weights, elig=elig)
+}
+```
+
+## Fully Shared Approximate Q Learning
+
+```{r}
+initAVShare <- function(exper, stFns, rFn, qFns, actions, def=6, dL=0.999, dE=0.999, dG = 0.9, alpha=0.8, eps=0.2, lambda=0.2, gamma=0.8, nAVs=c(1, 5), buffer = 400, replaceTarget = 20) {
+  avParams <- list()
+  nCs <- length(nAVs)
+  for (i in 1:nCs) {
+    exper$cars$type[nAVs[i]] <- 2
+    exper$cars$ef[nAVs[i]] <- 0
+  }
+  
+  avParams$sharedTable <- list(targetWeights = rep(1, length(qFns)),
+                               outputWeights = rep(1, length(qFns)),
+                               elig = rep(0, length(qFns)),
+                               action = actions[1],
+                               state = rep(def, length(stFns)),
+                               valPred = 0,
+                               replayBuffer = as_tibble(data.frame(ID = exper$cars$ID[nAVs[1]], 
+                                                                   place = exper$cars$place[nAVs[1]], 
+                                                                   vP = 0, rT = 0, typeF = 1,
+                                                                   ngap = 1, ngap1 = 1, ngap2 = 1, ngap3 = 1,
+                                                                   fG = 1, fG1 = 1, fG2 = 1, fG3 = 1,
+                                                                   bG = 1, bG1 = 1, bG2 = 1, bG3 = 1,
+                                                                   sp1 = 0, sp2 = 0, sp3 = 0)))
+  
+  avParams$sharedParams <- list(stateList = stFns, rewardFn = rFn, qFns = qFns, actions = actions, dL = dL, dE = dE, dG = dG, alpha = alpha, eps = eps, lambda = lambda, gamma = gamma, buffer = buffer, iters = replaceTarget, numAV = length(nAVs))
+  
+  for (i in 1:avParams$sharedParams$numAV) {
+    avParams$sharedTable$replayBuffer <- rbind(avParams$sharedTable$replayBuffer, avParams$sharedTable$replayBuffer)
+  }
+  
+  exper$avParams <- avParams
+  exper
+}
+updateCarsSLShare <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x, r), (exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[1]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[1]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r]),
+                                                       exper$avParams$sharedTable$replayBuffer)
+      
+      oldQVal <- getQVal(qFns = exper$avParams$sharedParams$qFns, 
+                         state = exper$avParams$sharedTable$state, 
+                         action = exper$avParams$sharedTable$action, 
+                         weights = exper$avParams$sharedTable$outputWeights)
+      grad <- unlist(lapply(exper$avParams$sharedParams$qFns, 
+                            function(f) f(exper$avParams$sharedTable$state, 
+                                          exper$avParams$sharedTable$action)))
+      mQ <- maxQ(qFns = exper$avParams$sharedParams$qFns, 
+                 newState = min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS + 1), 
+                 actions = exper$avParams$sharedParams$actions[exper$avParams$sharedParams$actions < min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1)], 
+                 weights = exper$avParams$sharedTable$targetWeights, 
+                 eps = exper$avParams$sharedParams$eps)
+      updates <- linQUpdate(maxQVal = mQ$value, oldQVal = oldQVal, grad = grad, 
+                            weights = exper$avParams$sharedTable$outputWeights, 
+                            newReward = sum(exper$cars$speed[exper$cars$type == 2])/(5*sum(exper$cars$type == 2)), 
+                            elig = exper$avParams$sharedTable$elig, 
+                            gamma = exper$avParams$sharedParams$gamma, 
+                            lambda = exper$avParams$sharedParams$lambda, 
+                            alpha = exper$avParams$sharedParams$alpha)
+      
+      exper$avParams$sharedTable$outputWeights <- updates$weights
+      exper$avParams$sharedTable$elig <- updates$elig
+      exper$cars$speed[x] <- mQ$action
+      exper$avParams$sharedTable$action <- mQ$action
+      exper$avParams$sharedTable$valPred <- mQ$value
+      exper$avParams$sharedTable$state <- min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1)
+      exper$avParams$sharedTable$replayBuffer[1, 3] <- mQ$value
+      
+    } else {
+      exper$cars$speed[x] <- pickSpeedSV(min(exper$road[[1]][exper$cars$place[x] + 1,]$fG - 1, exper$road[[1]][exper$cars$place[x] + 1,]$mS), exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+  
+  exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+  exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+  exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+  
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+fullUpdateSLShare <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <-  exper %>% updateRoad %>% updateCarsSLShare %>% updateRoad
+    rStats <- getStatsSL(cars = exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars)))
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  
+  for (i in 1:iters) {
+    #print(i)
+    if (i %% exper$avParams$sharedParams$iters == 5) {
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+    pC <- exper$cars
+    exper <- exper %>% updateCarsSLShare %>% updateRoad
+    rStats <- bind_rows(rStats, cbind(getStatsSL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+```
+
+## NN!
+
+```{r}
+updateCarsSLShare <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x), (exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[1]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[1]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r], exper$avParams$sharedTable$replayBuffer$sp3[r]),
+                                                       exper$avParams$sharedTable$replayBuffer)
+      
+      oldQVal <- getQVal(qFns = exper$avParams$sharedParams$qFns, 
+                         state = exper$avParams$sharedTable$state, 
+                         action = exper$avParams$sharedTable$action, 
+                         weights = exper$avParams$sharedTable$outputWeights)
+      grad <- unlist(lapply(exper$avParams$sharedParams$qFns, 
+                            function(f) f(exper$avParams$sharedTable$state, 
+                                          exper$avParams$sharedTable$action)))
+      mQ <- maxQ(qFns = exper$avParams$sharedParams$qFns, 
+                 newState = min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS + 1), 
+                 actions = exper$avParams$sharedParams$actions[exper$avParams$sharedParams$actions < min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1)], 
+                 weights = exper$avParams$sharedTable$targetWeights, 
+                 eps = exper$avParams$sharedParams$eps)
+      updates <- linQUpdate(maxQVal = mQ$value, oldQVal = oldQVal, grad = grad, 
+                            weights = exper$avParams$sharedTable$outputWeights, 
+                            newReward = sum(exper$cars$speed[exper$cars$type == 2])/(5*sum(exper$cars$type == 2)), 
+                            elig = exper$avParams$sharedTable$elig, 
+                            gamma = exper$avParams$sharedParams$gamma, 
+                            lambda = exper$avParams$sharedParams$lambda, 
+                            alpha = exper$avParams$sharedParams$alpha)
+      
+      exper$avParams$sharedTable$outputWeights <- updates$weights
+      exper$avParams$sharedTable$elig <- updates$elig
+      exper$cars$speed[x] <- mQ$action
+      exper$avParams$sharedTable$action <- mQ$action
+      exper$avParams$sharedTable$valPred <- mQ$value
+      exper$avParams$sharedTable$state <- min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1)
+      exper$avParams$sharedTable$replayBuffer[1, 3] <- mQ$value
+      
+    } else {
+      exper$cars$speed[x] <- pickSpeedSV(min(exper$road[[1]][exper$cars$place[x] + 1,]$fG - 1, exper$road[[1]][exper$cars$place[x] + 1,]$mS), exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+  
+  exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+  exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+  exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+  
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+fullUpdateSLShare <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <-  exper %>% updateRoad %>% updateCarsSLShare %>% updateRoad
+    rStats <- getStatsSL(cars = exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars)))
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  
+  for (i in 1:iters) {
+    print(i)
+    if (i %% exper$avParams$sharedParams$iters == 5) {
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+    pC <- exper$cars
+    exper <- exper %>% updateCarsSLShare %>% updateRoad
+    rStats <- bind_rows(rStats, cbind(getStatsSL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+
+initAVnn <- function(exper, stFns, rFn, qFns, actions, def=6, dL=0.999, dE=0.999, dG = 0.9, alpha=0.8, eps=0.2, lambda=0.2, gamma=0.8, nAVs=c(1, 5), buffer = 400, replaceTarget = 20, rounds = 50) {
+  avParams <- list()
+  nCs <- length(nAVs)
+  for (i in 1:nCs) {
+    exper$cars$type[nAVs[i]] <- 2
+    exper$cars$ef[nAVs[i]] <- 0
+  }
+  avParams$sharedTable <- list(targetWeights = rep(1, length(qFns)),
+                               outputWeights = rep(1, length(qFns)),
+                               elig = rep(0, length(qFns)),
+                               action = actions[1],
+                               state = rep(def, length(stFns)),
+                               valPred = 0,
+                               replayBuffer = as_tibble(data.frame(ID = exper$cars$ID[nAVs[1]], 
+                                                                   place = exper$cars$place[nAVs[1]], 
+                                                                   vP = 0, rT = 0, typeF = 1,
+                                                                   ngap = 1, ngap1 = 1, ngap2 = 1, ngap3 = 1,
+                                                                   fG = 1, fG1 = 1, fG2 = 1, fG3 = 1,
+                                                                   bG = 1, bG1 = 1, bG2 = 1, bG3 = 1,
+                                                                   sp = 0, sp1 = 0, sp2 = 0, sp3 = 0)))
+  avParams$sharedParams <- list(stateList = stFns, rewardFn = rFn, qFns = qFns, actions = actions, dL = dL, dE = dE, dG = dG, alpha = alpha, eps = eps, lambda = lambda, gamma = gamma, buffer = buffer, iters = replaceTarget, numAV = length(nAVs), rounds = rounds)
+  #  for (i in 1:avParams$sharedParams$numAV) {
+  #    avParams$sharedTable$replayBuffer <- rbind(avParams$sharedTable$replayBuffer, avParams$sharedTable$replayBuffer)
+  #  }
+  exper$avParams <- avParams
+  exper
+}
+updateCarsSLnn <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x), (exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[1]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[1]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[1]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r], exper$avParams$sharedTable$replayBuffer$sp3[r]), 
+                                                       exper$avParams$sharedTable$replayBuffer)
+      
+      # Select new action
+      msp <- unlist(exper$avParams$sharedTable$replayBuffer$ngap[1] - 1)
+      qVals <- unlist(lapply(0:msp, function (a) 
+        predict(exper$avParams$sharedTable$outputWeights, as.matrix(cbind(sp1 = a, exper$avParams$sharedTable$replayBuffer[1, c(5, 6:8, 10:12, 14:16, 18, 19, 20)]), nrow=1)) %>% as.vector()))
+      mQA <- sample(c(which.max(qVals) - 1, 0:msp), 1, prob=c(1 - exper$avParams$sharedParams$eps, rep(exper$avParams$sharedParams$eps, msp + 1)))
+      
+      exper$cars$speed[x] <- mQA
+      exper$avParams$sharedTable$action <- mQA
+      exper$avParams$sharedTable$valPred <- max(qVals)
+      exper$avParams$sharedTable$replayBuffer[1, 3] <- max(qVals)
+    } else {
+      exper$cars$speed[x] <- pickSpeedSV(min(exper$road[[1]][exper$cars$place[x] + 1,]$fG - 1, exper$road[[1]][exper$cars$place[x] + 1,]$mS), exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+  
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+fullUpdateSLnn <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <- fullUpdateSLShare(exper, 100, TRUE)
+    rStats <- exper$rStats
+    exper <- exper$exper
+    exper$avParams$sharedTable$outputWeights <- keras_model_sequential()
+    exper$avParams$sharedTable$outputWeights %>% 
+      layer_dense(units = 32, activation = 'relu', input_shape = c(14)) %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 32, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 32, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 16, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 1, activation = 'linear') %>% 
+      compile(optimizer = 'adam', loss = 'mse')#, metrics = list('mae'))
+    
+    exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    exper$avParams$sharedTable$replayBuffer <- exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3))
+    ind <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer, replace=TRUE)
+    
+    exper$avParams$sharedTable$outputWeights %>% 
+      fit(matrix(unlist(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 21)]), ncol=14),
+          matrix(exper$avParams$sharedTable$replayBuffer$vP[ind], ncol=1),
+          epochs = 10, batch_size = 32, view_metrics = FALSE, verbose = 0)
+    exper$avParams$sharedTable$targetWeights %>% 
+      fit(matrix(unlist(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 21)]), ncol=14),
+          matrix(exper$avParams$sharedTable$replayBuffer$vP[ind], ncol=1),
+          epochs = 10, batch_size = 32, view_metrics = FALSE, verbose = 0)
+    
+    exper$avParams$sharedTable$replayBuffer <- sample_n(exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3)), exper$avParams$sharedTable$replayBuffer*4, replace=TRUE)
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  
+  for (i in 1:iters) {
+    if (i %% exper$avParams$sharedParams$iters == 1) {
+      print(i)
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+    
+    pC <- exper$cars
+    exper <- exper %>% updateCarsSLnn %>% updateRoad
+    
+    #if (i %% 5 == 1) {
+    bufferInd <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer)
+    oldSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 21)]
+    newSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(5, 6:8, 10:12, 14:16, 18, 19, 20)]
+    rewardP <- exper$avParams$sharedTable$replayBuffer$rT[bufferInd]
+    #Re-make Outputs on each iter
+    yt <- rewardP + exper$avParams$sharedParams$gamma * apply(do.call(cbind, lapply(0:5, function(sp) as.vector(predict(exper$avParams$sharedTable$targetWeights, as.matrix(cbind(sp1 = pmin(sp, newSt$ngap-1), newSt)))))), 1, max)
+    
+    exper$avParams$sharedTable$outputWeights %>% 
+      fit(matrix(unlist(oldSt), ncol=14), matrix(yt, ncol=1),
+          epochs = 10, batch_size = 100, view_metrics = FALSE, verbose = 0)
+    #}
+    
+    exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+    exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+    exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+    
+    rStats <- bind_rows(rStats, cbind(getStatsSL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+```
+
+# DQN DL Infrastructure Only Speed Decisions
+
+```{r}
+updateCarsDLShareF <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x), (exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[exper$cars$lane[x]]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r],
+                                                         exper$cars$lane[x], 
+                                                         exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fGO[r], exper$avParams$sharedTable$replayBuffer$fGO1[r], exper$avParams$sharedTable$replayBuffer$fGO2[r], #ForwardGaps
+                                                         exper$road[[which(exper$cars$lane[x] != c(1, 2))]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bGO[r], exper$avParams$sharedTable$replayBuffer$bGO1[r], exper$avParams$sharedTable$replayBuffer$bGO2[r]), #BackwardGaps
+                                                       exper$avParams$sharedTable$replayBuffer)
+      oldQVal <- getQVal(qFns = exper$avParams$sharedParams$qFns, 
+                         state = exper$avParams$sharedTable$state, 
+                         action = exper$avParams$sharedTable$action, 
+                         weights = exper$avParams$sharedTable$outputWeights)
+      grad <- unlist(lapply(exper$avParams$sharedParams$qFns, 
+                            function(f) f(exper$avParams$sharedTable$state, 
+                                          exper$avParams$sharedTable$action)))
+      mQ <- maxQ(qFns = exper$avParams$sharedParams$qFns, 
+                 newState = min(exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$mS + 1), 
+                 actions = exper$avParams$sharedParams$actions[exper$avParams$sharedParams$actions < min(exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$mS+1)], 
+                 weights = exper$avParams$sharedTable$targetWeights, 
+                 eps = exper$avParams$sharedParams$eps)
+      updates <- linQUpdate(maxQVal = mQ$value, oldQVal = oldQVal, grad = grad, 
+                            weights = exper$avParams$sharedTable$outputWeights, 
+                            newReward = sum(exper$cars$speed[exper$cars$type == 2])/(5*sum(exper$cars$type == 2)), 
+                            elig = exper$avParams$sharedTable$elig, 
+                            gamma = exper$avParams$sharedParams$gamma, 
+                            lambda = exper$avParams$sharedParams$lambda, 
+                            alpha = exper$avParams$sharedParams$alpha)
+      exper$avParams$sharedTable$outputWeights <- updates$weights
+      exper$avParams$sharedTable$elig <- updates$elig
+      exper$cars$speed[x] <- mQ$action
+      exper$avParams$sharedTable$action <- mQ$action
+      exper$avParams$sharedTable$valPred <- mQ$value
+      exper$avParams$sharedTable$state <- min(exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$mS+1)
+      exper$avParams$sharedTable$replayBuffer[1, 3] <- mQ$value
+    } else {
+      g <- pickLaneDL(cL = exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,], 
+                      oL = exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,],
+                      mSp = exper$road$c$mSp,
+                      car = exper$cars[x,])
+      exper$cars$lane[x] <- g[1]
+      exper$cars$speed[x] <- pickSpeed(g[2]-1, exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+  exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+  exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+  exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+
+fullUpdateDLShareF <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <-  exper %>% updateRoad %>% entries(exper$road$c$nC) %>% updateRoad %>% updateCarsDLShareF %>% exits
+    rStats <- getStatsDL(cars = exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars)))
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  realMs <- list()
+  for (l in 1:exper$road$c$lanes) {
+    realMs[[l]] <- exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)]
+  }
+  for (i in 1:iters) {
+    print(i)
+    if (i %% exper$road$c$it == 0) {
+      for (l in 1:exper$road$c$lanes) {
+        realMs[[l]] <- exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)]
+        exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)] <- 0
+      }
+    }
+    if (i %% exper$road$c$it == 1) {
+      for (l in 1:exper$road$c$lanes) {
+        exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)] <- realMs[[l]]
+      }
+    }
+    if (i %% exper$avParams$sharedParams$iters == 5) {
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+    pC <- exper$cars
+    exper <- exper %>% updateRoad %>% updateCarsDLShareF
+    print(exper$cars$place %>% diff %>% abs %>% summary)
+    rStats <- bind_rows(rStats, cbind(getStatsDL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE), laneChg = sum(lane.x != lane.y, na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+
+initAVDLF <- function(exper, stFns, rFn, qFns, actions, def=6, dL=0.999, dE=0.999, dG = 0.9, alpha=0.8, eps=0.2, lambda=0.2, gamma=0.8, nAVs=c(1, 5), buffer = 400, replaceTarget = 20, rounds = 50) {
+  avParams <- list()
+  nCs <- length(nAVs)
+  for (i in 1:nCs) {
+    exper$cars$type[nAVs[i]] <- 2
+    exper$cars$ef[nAVs[i]] <- 0
+  }
+  avParams$sharedTable <- list(targetWeights = rep(1, length(qFns)),
+                               outputWeights = rep(1, length(qFns)),
+                               elig = rep(0, length(qFns)),
+                               action = actions[1],
+                               state = rep(def, length(stFns)),
+                               valPred = 0,
+                               replayBuffer = as_tibble(data.frame(ID = exper$cars$ID[nAVs[1]], 
+                                                                   place = exper$cars$place[nAVs[1]], 
+                                                                   vP = 0, rT = 0, typeF = 1,
+                                                                   ngap = 1, ngap1 = 1, ngap2 = 1, ngap3 = 1,
+                                                                   fG = 1, fG1 = 1, fG2 = 1, fG3 = 1,
+                                                                   bG = 1, bG1 = 1, bG2 = 1, bG3 = 1,
+                                                                   sp1 = 0, sp2 = 0, sp3 = 0,
+                                                                   lane = exper$cars$lane[nAVs[1]],
+                                                                   fGO = 1, fGO1 = 1, fGO2 = 1, fGO3 = 1,
+                                                                   bGO = 1, bGO1 = 1, bGO2 = 1, bGO3 = 1)))
+  avParams$sharedParams <- list(stateList = stFns, rewardFn = rFn, qFns = qFns, actions = actions, dL = dL, dE = dE, dG = dG, alpha = alpha, eps = eps, lambda = lambda, gamma = gamma, buffer = buffer, iters = replaceTarget, numAV = length(nAVs), rounds = rounds)
+#  for (i in 1:avParams$sharedParams$numAV) {
+#    avParams$sharedTable$replayBuffer <- rbind(avParams$sharedTable$replayBuffer, avParams$sharedTable$replayBuffer)
+#  }
+  exper$avParams <- avParams
+  exper
+}
+
+updateCarsDLnnF <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x), (exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, exper$road[[1]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[exper$cars$lane[x]]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r],
+                                                         exper$cars$lane[x],
+                                                         exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fGO[r], exper$avParams$sharedTable$replayBuffer$fGO1[r], exper$avParams$sharedTable$replayBuffer$fGO2[r], #ForwardGaps
+                                                         exper$road[[which(exper$cars$lane[x] != c(1, 2))]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bGO[r], exper$avParams$sharedTable$replayBuffer$bGO1[r], exper$avParams$sharedTable$replayBuffer$bGO2[r]), #BackwardGaps), 
+                                                       exper$avParams$sharedTable$replayBuffer)
+
+      # Select new action
+      msp <- unlist(exper$avParams$sharedTable$replayBuffer$ngap[1] - 1)
+      qVals <- unlist(lapply(0:msp, function (a) 
+        predict(exper$avParams$sharedTable$outputWeights, as.matrix(cbind(sp1 = a, exper$avParams$sharedTable$replayBuffer[1, c(5, 6:8, 10:12, 14:16, 18, 19, 21, 22:24, 26:28)]), nrow=1)) %>% as.vector()))
+      mQA <- sample(c(which.max(qVals) - 1, 0:msp), 1, prob=c(1 - exper$avParams$sharedParams$eps, rep(exper$avParams$sharedParams$eps, msp + 1)))
+      
+      exper$cars$speed[x] <- mQA
+      exper$avParams$sharedTable$action <- mQA
+      exper$avParams$sharedTable$valPred <- max(qVals)
+      exper$avParams$sharedTable$replayBuffer[1, 3] <- max(qVals)
+    } else {
+      g <- pickLaneDL(cL = exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,], 
+                      oL = exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,],
+                      mSp = exper$road$c$mSp,
+                      car = exper$cars[x,])
+      exper$cars$lane[x] <- g[1]
+      exper$cars$speed[x] <- pickSpeed(g[2]-1, exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+
+fullUpdateDLnnF <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <- fullUpdateDLShareF(exper, 100, TRUE)
+    rStats <- exper$rStats
+    exper <- exper$exper
+    
+    exper$avParams$sharedTable$outputWeights <- keras_model_sequential()
+    exper$avParams$sharedTable$outputWeights %>% 
+      layer_dense(units = 32, activation = 'relu', input_shape = c(20)) %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 32, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 32, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 16, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 1, activation = 'linear') %>% 
+      compile(optimizer = 'adam', loss = 'mse')#, metrics = list('mae'))
+    
+    exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    exper$avParams$sharedTable$replayBuffer <- exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3))
+    ind <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer, replace=TRUE)
+    
+    exper$avParams$sharedTable$outputWeights %>% 
+      fit(matrix(unlist(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 21, 23:25, 27:29)]), ncol=20),
+          matrix(exper$avParams$sharedTable$replayBuffer$vP[ind], ncol=1),
+          epochs = 10, batch_size = 32, view_metrics = FALSE, verbose = 0)
+    exper$avParams$sharedTable$targetWeights %>% 
+      fit(matrix(unlist(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 21, 23:25, 27:29)]), ncol=20),
+          matrix(exper$avParams$sharedTable$replayBuffer$vP[ind], ncol=1),
+          epochs = 10, batch_size = 32, view_metrics = FALSE, verbose = 0)
+    exper$avParams$sharedTable$replayBuffer <- sample_n(exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3)), 250, replace=TRUE)
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  realMs <- list()
+  for (l in 1:exper$road$c$lanes) {
+    realMs[[l]] <- exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)]
+  }
+  for (i in 1:iters) {
+    print(i)
+    if (i %% exper$road$c$it == 0) {
+      for (l in 1:exper$road$c$lanes) {
+        realMs[[l]] <- exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)]
+        exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)] <- 0
+      }
+    }
+    if (i %% exper$road$c$it == 1) {
+      for (l in 1:exper$road$c$lanes) {
+        exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)] <- realMs[[l]]
+      }
+    }
+    if (i %% exper$avParams$sharedParams$iters == 1) {
+      print(i)
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+    
+    pC <- exper$cars
+    exper <- exper %>% updateCarsDLnnF %>% updateRoad
+    
+    print(exper$cars$place %>% diff %>% abs %>% summary)
+    
+    #if (i %% 5 == 1) {
+      bufferInd <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer, replace=TRUE)
+      oldSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 21, 23:25, 27:29)]
+      newSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(5, 6:8, 10:12, 14:16, 18, 19, 21, 22:24, 26:28)]
+      rewardP <- exper$avParams$sharedTable$replayBuffer$rT[bufferInd]
+      
+      #Re-make Outputs on each iter
+      yt <- rewardP + exper$avParams$sharedParams$gamma * apply(do.call(cbind, lapply(0:5, function(sp) predict(exper$avParams$sharedTable$targetWeights, as.matrix(cbind(sp1 = pmin(sp, newSt$ngap-1), newSt))) %>% as.vector)), 1, max)
+      
+      exper$avParams$sharedTable$outputWeights %>% 
+        fit(matrix(unlist(oldSt), ncol=20), matrix(yt, ncol=1),
+            epochs = 5, batch_size = 32, view_metrics = FALSE, verbose = 0)
+    #}
+    exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+    exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+    exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+    rStats <- bind_rows(rStats, cbind(getStatsDL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE), laneChg = sum(lane.x != lane.y, na.rm = TRUE))))
+  }
+  list(exper = exper, rStats = rStats)
+}
+```
+
+# DQN DL Infrastructure With Lane Decisions
+
+```{r}
+getQValLS <- function(qFns, state, action, weights) {
+  sum(weights * unlist(lapply(qFns, function(x) x(state, action))))
+}
+maxQLS <- function(qFns, newState, actions, weights, eps) {
+  act <- unlist(lapply(actions, function(i) getQValLS(qFns, newState, i, weights)))
+  list(action = sample(c(actions[which.max(act)], actions), 1, prob=c(1-eps, rep(eps, length(actions)))), value = max(act))
+}
+linQUpdateLS <- function(maxQVal, oldQVal, newReward, grad, elig, weights, gamma, lambda, alpha) {
+  delta <- newReward + gamma*maxQVal - oldQVal
+  elig <- gamma*lambda*elig + grad
+  weights <- weights + alpha*delta*elig
+  list(weights=weights, elig=elig)
+}
+getActionSet <- function(exper, x) {
+  oGm <- min(exper$avParams$sharedTable$replayBuffer$fGO[1] - 1, exper$avParams$sharedTable$replayBuffer$ngap[1], 5)
+  unique(c(0:(exper$avParams$sharedTable$replayBuffer$ngap[1] - 1),
+           (5 + (exper$cars$speed[x]:oGm)) *
+             (oGm > 0) * (exper$cars$speed[x] <= oGm) * (exper$cars$speed[x] > 0) *
+             (5 < exper$avParams$sharedTable$replayBuffer$bGO[1] + exper$cars$speed[x])))
+}
+```
+
+```{r}
+initAVLS <- function(exper, stFns, rFn, qFns, actions = 0:10, def=6, dL=0.999, dE=0.999, dG = 0.9, alpha=0.8, eps=0.2, lambda=0.2, gamma=0.8, nAVs=c(1, 5), buffer = 400, replaceTarget = 20, rounds = 50) {
+  avParams <- list()
+  nCs <- length(nAVs)
+  for (i in 1:nCs) {
+    exper$cars$type[nAVs[i]] <- 2
+    exper$cars$ef[nAVs[i]] <- 0
+  }
+  avParams$sharedTable <- list(targetWeights = rep(1, length(qFns)),
+                               outputWeights = rep(1, length(qFns)),
+                               elig = rep(0, length(qFns)),
+                               action = actions[1],
+                               state = rep(def, length(stFns)),
+                               valPred = 0,
+                               replayBuffer = as_tibble(data.frame(ID = exper$cars$ID[nAVs[1]], 
+                                                                   place = exper$cars$place[nAVs[1]], 
+                                                                   vP = 0, rT = 0, typeF = 1,
+                                                                   ngap = 1, ngap1 = 1, ngap2 = 1, ngap3 = 1,
+                                                                   fG = 1, fG1 = 1, fG2 = 1, fG3 = 1,
+                                                                   bG = 1, bG1 = 1, bG2 = 1, bG3 = 1,
+                                                                   sp1 = 0, sp2 = 0, sp3 = 0,
+                                                                   fGO = 1, fGO1 = 1, fGO2 = 1, fGO3 = 1,
+                                                                   bGO = 1, bGO1 = 1, bGO2 = 1, bGO3 = 1,
+                                                                   lane = exper$cars$lane[nAVs[1]], prevLane = exper$cars$lane[nAVs[1]],
+                                                                   maxA = 0)))
+  avParams$sharedParams <- list(stateList = stFns, rewardFn = rFn, qFns = qFns, actions = actions, 
+                                dL = dL, dE = dE, dG = dG, alpha = alpha, eps = eps, lambda = lambda, gamma = gamma, 
+                                buffer = buffer, iters = replaceTarget, numAV = length(nAVs))
+#  for (i in 1:avParams$sharedParams$numAV) {
+#    avParams$sharedTable$replayBuffer <- rbind(avParams$sharedTable$replayBuffer, avParams$sharedTable$replayBuffer)
+#  }
+  exper$avParams <- avParams
+  exper
+}
+
+updateCarsDLShareLS <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x), (exper$cars$lane[(x != nC)*x + 1] == exper$cars$lane[x])*(exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[exper$cars$lane[x]]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r], 
+                                                         exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fGO[r], exper$avParams$sharedTable$replayBuffer$fGO1[r], exper$avParams$sharedTable$replayBuffer$fGO2[r], #ForwardGaps
+                                                         exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,]$bG, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bGO[r], exper$avParams$sharedTable$replayBuffer$bGO1[r], exper$avParams$sharedTable$replayBuffer$bGO2[r],
+                                                         exper$cars$lane[x], exper$cars$lane[r], 0), #BackwardGaps
+                                                       exper$avParams$sharedTable$replayBuffer)
+      actionS <- getActionSet(exper, x)
+      print(actionS)
+      exper$avParams$sharedTable$replayBuffer$maxA[1] <- max(c(0, actionS[actionS > 5]))
+      
+      print(exper$avParams$sharedTable$replayBuffer[1,])
+      
+      oldQVal <- getQValLS(qFns = exper$avParams$sharedParams$qFns, 
+                           state = exper$avParams$sharedTable$state, 
+                           action = exper$avParams$sharedTable$action, 
+                           weights = exper$avParams$sharedTable$outputWeights)
+      grad <- unlist(lapply(exper$avParams$sharedParams$qFns, 
+                            function(f) f(exper$avParams$sharedTable$state, 
+                                          exper$avParams$sharedTable$action)))
+      mQ <- maxQLS(qFns = exper$avParams$sharedParams$qFns, 
+                   newState = exper$avParams$sharedParams$stateList[[1]](exper, x), 
+                   actions = actionS, 
+                   weights = exper$avParams$sharedTable$targetWeights, 
+                   eps = exper$avParams$sharedParams$eps)
+      updates <- linQUpdateLS(maxQVal = mQ$value, oldQVal = oldQVal, grad = grad, 
+                              weights = exper$avParams$sharedTable$outputWeights, 
+                              newReward = exper$avParams$sharedParams$rewardFn(exper, x),
+                              elig = exper$avParams$sharedTable$elig, 
+                              gamma = exper$avParams$sharedParams$gamma, 
+                              lambda = exper$avParams$sharedParams$lambda, 
+                              alpha = exper$avParams$sharedParams$alpha)
+      exper$avParams$sharedTable$outputWeights <- updates$weights
+      exper$avParams$sharedTable$elig <- updates$elig
+      exper$cars$speed[x] <- mQ$action - (mQ$action > 5)*5
+      exper$cars$lane[x] <- c(exper$cars$lane[x], which(exper$cars$lane[x] != c(1, 2)))[ceiling((1+mQ$action)/6)]
+      exper$avParams$sharedTable$action <- mQ$action
+      exper$avParams$sharedTable$valPred <- mQ$value
+      exper$avParams$sharedTable$state <- stfG2L(exper, x)
+      exper$avParams$sharedTable$replayBuffer[1, 3] <- mQ$value
+    } else {
+      g <- pickLaneDL(cL = exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,], 
+                      oL = exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,],
+                      mSp = exper$road$c$mSp,
+                      car = exper$cars[x,])
+      exper$cars$lane[x] <- g[1]
+      exper$cars$speed[x] <- pickSpeed(g[2]-1, exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+  exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+  exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+  exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+
+fullUpdateDLShareLS <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <-  exper %>% updateRoad %>% entries(exper$road$c$nC) %>% updateRoad %>% updateCarsDLShareLS %>% exits
+    rStats <- getStatsDL(cars = exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars)))
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  realMs <- list()
+  for (l in 1:exper$road$c$lanes) {
+    realMs[[l]] <- exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)]
+  }
+  for (i in 1:iters) {
+    print(i)
+    if (i %% exper$road$c$it == 0) {
+      for (l in 1:exper$road$c$lanes) {
+        realMs[[l]] <- exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)]
+        exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)] <- 0
+      }
+    }
+    if (i %% exper$road$c$it == 1) {
+      for (l in 1:exper$road$c$lanes) {
+        exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)] <- realMs[[l]]
+      }
+    }
+    if (i %% exper$avParams$sharedParams$iters == 5) {
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+    pC <- exper$cars
+    exper <- exper %>% updateRoad %>% updateCarsDLShareLS
+    if (min(exper$cars$place %>% diff %>% abs) == 0) {
+      return(exper)
+    }
+    print(exper$cars$place %>% diff %>% abs %>% summary)
+    print(exper$cars[,1:5] %>% t)
+    rStats <- bind_rows(rStats, cbind(getStatsDL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE), laneChg = sum(lane.x != lane.y, na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+```
+
+```{r}
+updateCarsDLnnLS <- function(exper) {
+  nC <- nrow(exper$cars)
+  nAV <- exper$avParams$sharedParams$numAV
+  for (x in nC:1) {
+    if (exper$cars$type[x] == 2) {
+      print("st")
+      r <- which(exper$avParams$sharedTable$replayBuffer$ID == exper$cars$ID[x])[1]
+      exper$avParams$sharedTable$replayBuffer <- rbind(c(exper$cars$ID[x], exper$cars$place[x], 
+                                                         0, exper$avParams$sharedParams$rewardFn(exper, x), (exper$cars$lane[(x != nC)*x + 1] == exper$cars$lane[x])*(exper$cars$type[(x != nC)*x + 1] == 2),
+                                                         min(exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$mS+1), # New Usable Gap
+                                                         exper$avParams$sharedTable$replayBuffer$ngap[r], exper$avParams$sharedTable$replayBuffer$ngap1[r], exper$avParams$sharedTable$replayBuffer$ngap2[r], # UsableGaps
+                                                         exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fG[r], exper$avParams$sharedTable$replayBuffer$fG1[r], exper$avParams$sharedTable$replayBuffer$fG2[r], #ForwardGaps
+                                                         exper$road[[exper$cars$lane[x]]][(exper$cars$place[x]==0)*100 + exper$cars$place[x],]$bG + 1, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bG[r], exper$avParams$sharedTable$replayBuffer$bG1[r], exper$avParams$sharedTable$replayBuffer$bG2[r], #BackwardGaps
+                                                         exper$cars$speed[x], exper$avParams$sharedTable$replayBuffer$sp1[r], exper$avParams$sharedTable$replayBuffer$sp2[r],
+                                                         exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,]$fG, # New Forward Gap
+                                                         exper$avParams$sharedTable$replayBuffer$fGO[r], exper$avParams$sharedTable$replayBuffer$fGO1[r], exper$avParams$sharedTable$replayBuffer$fGO2[r], #ForwardGaps
+                                                         exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,]$bG, # Current Back Gap
+                                                         exper$avParams$sharedTable$replayBuffer$bGO[r], exper$avParams$sharedTable$replayBuffer$bGO1[r], exper$avParams$sharedTable$replayBuffer$bGO2[r],
+                                                         exper$cars$lane[x], exper$cars$lane[r], 0), #BackwardGaps
+                                                       exper$avParams$sharedTable$replayBuffer)
+      actionS <- getActionSet(exper, x)
+      exper$avParams$sharedTable$replayBuffer[1, 30] <- max(c(0, actionS[actionS > 5]))
+      
+      print(actionS)
+      print(exper$avParams$sharedTable$replayBuffer[1,])
+      print(exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,])
+      print(exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,])
+      print(exper$cars[c(x,(x != nC)*(x+1)),])
+      # Select new action
+      qVals <- unlist(lapply(actionS, function (a) as.vector(predict(exper$avParams$sharedTable$outputWeights,
+                                                                     as.matrix(cbind(sp1 = a - (a > 5)*5, 
+                                                                                     exper$avParams$sharedTable$replayBuffer[1, c(5, 6:8, 10:12, 14:16, 18, 19, 21:23, 25:27)],  
+                                                                                     lane = (a > 5)*which(exper$cars$lane[x] != c(1, 2)) + (a <= 5)*exper$cars$lane[x]), 
+                                                                               nrow=1)))))
+      mQA <- sample(c(actionS[which.max(qVals)], actionS), 1, prob=c(1 - exper$avParams$sharedParams$eps, rep(exper$avParams$sharedParams$eps, length(actionS))))
+      
+      exper$cars$speed[x] <- mQA - (mQA > 5)*5
+      exper$cars$lane[x] <- c(exper$cars$lane[x], which(exper$cars$lane[x] != c(1, 2)))[ceiling((1+mQA)/6)]
+      
+      exper$avParams$sharedTable$action <- mQA
+      exper$avParams$sharedTable$valPred <- max(qVals)
+      exper$avParams$sharedTable$replayBuffer$vP[1] <- max(qVals)
+    } else {
+      gUsable <- pickLaneDL(cL = exper$road[[exper$cars$lane[x]]][exper$cars$place[x] + 1,], 
+                      oL = exper$road[[which(exper$cars$lane[x] != c(1, 2))]][exper$cars$place[x] + 1,],
+                      mSp = exper$road$c$mSp,
+                      car = exper$cars[x,])
+      exper$cars$lane[x] <- gUsable[1]
+      exper$cars$speed[x] <- pickSpeed(gUsable[2]-1, exper$cars$speed[x], exper$cars$type[x])
+    }
+  }
+  exper$cars$place <- (exper$cars$place + exper$cars$speed) %% exper$road$c$len
+  exper$cars$ef <- pmax(0, exper$cars$ef + rnorm(nrow(exper$cars), exper$road$c$exit, exper$road$c$exit))
+  exper$cars <- exper$cars %>% arrange(lane, place)
+  exper
+}
+
+fullUpdateDLnnLS <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <- fullUpdateDLShareLS(exper, 1800, TRUE)
+    rStats <- exper$rStats
+    exper <- exper$exper
+    
+    exper$avParams$sharedTable$outputWeights <- keras_model_sequential()
+    exper$avParams$sharedTable$outputWeights %>% 
+      layer_dense(units = 32, activation = 'relu', input_shape = c(20)) %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 32, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 32, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 1, activation = 'linear') %>% 
+      compile(optimizer = 'adam', loss = 'mse')#, metrics = list('mae'))
+    
+    exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    exper$avParams$sharedTable$replayBuffer <- exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3))
+    ind <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer, replace=TRUE)
+    
+    exper$avParams$sharedTable$outputWeights %>% 
+      fit(matrix(unlist(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 22:24, 26:30)]), ncol=21),
+          matrix(exper$avParams$sharedTable$replayBuffer$vP[ind], ncol=1),
+          epochs = 5, batch_size = 100, view_metrics = FALSE, verbose = 0)
+    exper$avParams$sharedTable$targetWeights %>% 
+      fit(matrix(unlist(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 22:24, 26:30)]), ncol=21),
+          matrix(exper$avParams$sharedTable$replayBuffer$vP[ind], ncol=1),
+          epochs = 5, batch_size = 100, view_metrics = FALSE, verbose = 0)
+    exper$avParams$sharedTable$replayBuffer <- sample_n(exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3)), 2000, replace=TRUE)
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  realMs <- list()
+  for (l in 1:exper$road$c$lanes) {
+    realMs[[l]] <- exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)]
+  }
+  for (i in 1:iters) {
+    print(i)
+    if (i %% exper$road$c$it == 0) {
+      for (l in 1:exper$road$c$lanes) {
+        realMs[[l]] <- exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)]
+        exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)] <- 0
+      }
+    }
+    if (i %% exper$road$c$it == 1) {
+      for (l in 1:exper$road$c$lanes) {
+        exper$road[[l]]$mS[seq(1, exper$road$c$len, 100)] <- realMs[[l]]
+      }
+    }
+    if (i %% exper$avParams$sharedParams$iters == 5) {
+      print(i)
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+    
+    pC <- exper$cars
+    exper <- exper %>% updateCarsDLnnLS %>% updateRoad
+    
+    print(exper$cars %>% t)
+    if (min(exper$cars$place %>% diff %>% abs) == 0) {
+      return(exper)
+    }
+    print(exper$cars$place %>% diff %>% abs %>% summary)
+  
+    #if (i %% 5 == 1) {
+      bufferInd <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer, replace=TRUE)
+      oldSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(18, 5, 7:9, 11:13, 15:17, 19, 20, 22:24, 26:28, 29)]
+      newSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(5, 6:8, 10:12, 14:16, 18, 19, 21:23, 25:27, 29, 30)]
+      rewardP <- exper$avParams$sharedTable$replayBuffer$rT[bufferInd]
+      
+      #Re-make Outputs on each iter
+      yt <- rewardP + exper$avParams$sharedParams$gamma * apply(do.call(cbind, lapply(0:10, function(sp) 
+        as.vector(predict(exper$avParams$sharedTable$targetWeights, 
+                          as.matrix(cbind(sp1 = (sp > 5)*(sp - 5 >= newSt$sp1)*pmin(sp-5, newSt$fGO)*newSt$maxA + (sp < 6)*pmin(sp, newSt$ngap-1), newSt[,1:18], 
+                                          lane = (sp < 6)*newSt$lane + (sp > 6)*newSt$lane*(newSt$maxA == 0) + (sp > 5)*(newSt$maxA != 0)*(2 - (newSt$lane != c(1))))))))), 1, max)
+      
+      #print(yt)
+      exper$avParams$sharedTable$outputWeights %>% 
+        fit(matrix(unlist(oldSt), ncol=20), matrix(yt, ncol=1),
+            epochs = 10, batch_size = 32, view_metrics = FALSE, verbose = 0)
+    #}
+    exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+    exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+    exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+    rStats <- bind_rows(rStats, cbind(getStatsDL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE), laneChg = sum(lane.x != lane.y, na.rm = TRUE))))
+  }
+  list(exper = exper, rStats = rStats)
+}
+```
+
+```{r}
+sts <- list(stfG2L, stfG, stfGbG)
+rwrds <- list(rSp, rSpShare, rGap, rGapShare)
+
+rL <- 100
+tuple <- c(40, 4, 2, 1)
+#tuple <- c(40, 40, 2, 0)
+
+stFn <- 1
+nC <- tuple[1]
+numAVs <- tuple[2]
+rFn <- tuple[3]
+typ <- tuple[4]
+AVs <- ((typ == 0)*sample(1:nC, numAVs) + (typ == 1)*1:numAVs) %>% sort
+
+e1n <- buildExperiment(roadLen = rL, lanes = 2, maxSpeed = list(rep(5, rL), rep(5, rL)),
+                       preference = list(rep(0, rL), rep(0, rL)),
+                       numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+  initAVLS(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn5a, qFn5b, qFn5c, qFn5d),
+           actions = 0:10, def = 6, dL = 0.998, dE = 0.998, dG = 1.001, alpha=0.8, eps=0.5, lambda=0.1, gamma=0.1, nAVs = AVs, buffer = 200, replaceTarget = 20)
+
+#time1 <- Sys.time()
+e1n <- fullUpdateDLnnLS(e1n, iters = 1, new=TRUE)
+#time2 <- Sys.time()
+#print(time2 - time1)
+saveRDS(e1n, paste0("./AVResults/lchS40/extnumAV", numAVs, "typ", typ, "rFn", rFn, "nC", nC, ".rds"))
+
+e1n$exper$avParams$sharedParams$alpha <- 0.8
+e1n$exper$avParams$sharedParams$eps <- 0.5
+e1n$exper$avParams$sharedParams$gamma <- 0.1
+e1n$exper$avParams$sharedParams$dG <- 1.001
+e1n$exper$avParams$sharedParams$buffer <- 100*min(numAVs, 10)
+e1n$exper$avParams$sharedParams$iters <- 40
+
+for (i in 1:10) {
+  #time1 <- Sys.time()
+  e1n <- fullUpdateDLnnLS(e1n, iters = 100, new=FALSE)
+  #time2 <- Sys.time()
+  #print(time2 - time1)
+  saveRDS(e1n, paste0("~/LocalDocs/TrafficCode/AVResults/lchN40/extnumAV", numAVs, "typ", typ, "rFn", rFn, "nC", nC, ".rds"))
+}
+
+e1n$exper$avParams$sharedParams$dL <- 0.999
+e1n$exper$avParams$sharedParams$dE <- 0.999
+e1n$exper$avParams$sharedParams$dG <- 1.001
+e1n$exper$avParams$sharedParams$buffer <- 200*min(numAVs, 10)
+e1n$exper$avParams$sharedParams$iters <- 10
+
+#e1n <- readRDS(paste0("~/LocalDocs/TrafficCode/AVResults/lchN40/extnumAV", numAVs, "typ", typ, "rFn", rFn, "nC", nC, ".rds"))
+for (i in 1:8) {
+  #time1 <- Sys.time()
+  e1n <- fullUpdateDLnnLS(e1n, iters = 100, new=FALSE)
+  #time2 <- Sys.time()
+  #print(time2 - time1)
+  saveRDS(e1n, paste0("~/LocalDocs/TrafficCode/AVResults/lchN40/extnumAV", numAVs, "typ", typ, "rFn", rFn, "nC", nC, ".rds"))
+}
+
+e1n$exper$avParams$sharedParams$dL <- 1
+e1n$exper$avParams$sharedParams$dE <- 1
+e1n$exper$avParams$sharedParams$dG<- 1
+e1n$exper$avParams$sharedParams$buffer <- 400*min(numAVs, 10)
+e1n$exper$avParams$sharedParams$iters <- 10
+
+#time1 <- Sys.time()
+e1n <- fullUpdateDLnnLS(e1n, iters = 199, new=FALSE)
+#time2 <- Sys.time()
+#print(time2 - time1)
+saveRDS(e1n, paste0("~/LocalDocs/TrafficCode/AVResults/lchN40/extnumAV", numAVs, "typ", typ, "rFn", rFn, "nC", nC, ".rds"))
+
+```
+
+# Experiments DL Lane Decisions Experiments
+
+```{r}
+sts <- list(stfG2L, stfG, stfGbG)
+rwrds <- list(rSp, rSpShare, rGap, rGapShare)
+
+stFn <- 1
+rFn <- 2
+numAVs <- 4
+typ <- 1
+
+rL <- 100
+nC <- 40
+AVs <- ((typ == 0)*c(sample(1:floor(nC/2), floor(numAVs/2)), sample(nC:ceiling((nC+1)/2), ceiling(numAVs/2))) + (typ == 1)*(c(1:(floor(numAVs/2)), nC:(nC + 1 - ceiling(numAVs/2))))) %>% sort
+
+res <- list()
+```
+
+```{r}
+e1n <- buildExperiment(roadLen = rL, lanes = 2, maxSpeed = list(rep(5, rL), rep(5, rL)),
+                       preference = list(rep(0, rL), rep(0, rL)),
+                       numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+  initAVLS(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn5a, qFn5b, qFn5c, qFn5d),
+           actions = 0:10, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.1, nAVs = AVs, buffer = 200, replaceTarget = 20)
+
+time1 <- Sys.time()
+e1n2 <- fullUpdateDLShareLS(e1n, iters = 1, new=TRUE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+time1 <- Sys.time()
+e1n <- fullUpdateDLShareLS(e1n2, iters = 1, new=FALSE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+time1 <- Sys.time()
+e1n2 <- fullUpdateDLShareLS(e1n, iters = 1, new=FALSE)
+time2 <- Sys.time()
+print(time2 - time1)
+```
+
+```{r}
+e1n <- buildExperiment(roadLen = rL, lanes = 2, maxSpeed = list(rep(5, rL), rep(5, rL)),
+                       preference = list(rep(0, rL), rep(0, rL)),
+                       numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+  initAVLS(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn5a, qFn5b, qFn5c, qFn5d),
+           actions = 0:10, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.1, nAVs = AVs, buffer = 200, replaceTarget = 20)
+
+time1 <- Sys.time()
+e1n2 <- fullUpdateDLnnLS(e1n, iters = 1, new=TRUE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+time1 <- Sys.time()
+e1n <- fullUpdateDLnnLS(e1n2, iters = 10, new=FALSE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+time1 <- Sys.time()
+e1n2 <- fullUpdateDLnnLS(e1n, iters = 10, new=FALSE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+e1n$exper$avParams$sharedParams$dL <- 0.998
+e1n$exper$avParams$sharedParams$dE <- 0.998
+e1n$exper$avParams$sharedParams$dG <- 1.0015
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateDLnnF(e1n, 299, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+```
+
+```{r}
+e1n <- buildExperiment(roadLen = rL, lanes = 2, maxSpeed = list(rep(5, rL), rep(5, rL)),
+                       preference = list(rep(0, rL), rep(0, rL)),
+                       numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+  initAVLS(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn1, qFn2, qFn2p),
+           actions = 0:5, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.1, nAVs = AVs, buffer = 200, replaceTarget = 20)
+
+time1 <- Sys.time()
+e1n <- fullUpdateDLShareLS(e1n, iters = 1, new=TRUE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+time1 <- Sys.time()
+e1n <- fullUpdateDLShareLS(e1n, iters = 10, new=FALSE)
+time2 <- Sys.time()
+print(time2 - time1)
+```
+
+```{r}
+time1 <- Sys.time()
+e1n <- fullUpdateDLnnF(e1n, iters = 399, new=TRUE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+e1n$exper$avParams$sharedParams$dL <- 0.998
+e1n$exper$avParams$sharedParams$dE <- 0.998
+e1n$exper$avParams$sharedParams$dG <- 1.0015
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateDLnnF(e1n, 299, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+```
+
+```{r}
+time1 <- Sys.time()
+e1nd <- buildExperiment(roadLen = rL, lanes = 2, maxSpeed = list(rep(5, rL), rep(5, rL)),
+                       preference = list(rep(0, rL), rep(0, rL)),
+                       numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+  initAVDL(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn1, qFn2, qFn2p),
+           actions = 0:5, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.1, nAVs = AVs, buffer = 200, replaceTarget = 20)
+
+time1 <- Sys.time()
+e1n <- fullUpdateDLnn(e1n, iters = 400, new=TRUE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+e1n$exper$avParams$sharedParams$dL <- 0.999
+e1n$exper$avParams$sharedParams$dE <- 0.999
+e1n$exper$avParams$sharedParams$dG <- 1.001
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 299, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- min(e1n$exper$avParams$sharedParams$buffer*2, nrow(e1n$exper$avParams$sharedTable$replayBuffer)/2)
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+e1n$exper$avParams$sharedParams$dL <- 1
+e1n$exper$avParams$sharedParams$dE <- 1
+e1n$exper$avParams$sharedParams$dG <- 1
+
+time2b <- Sys.time()
+#e1n <- fullUpdateSLnn(e1n, 1500, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+time1 <- Sys.time()
+#exp <- readRDS(paste0("./rcars20/", i))
+nn <- e1n
+
+nn$exper$avParams$sharedParams$dL <- 0.998
+nn$exper$avParams$sharedParams$dE <- 0.998
+nn$exper$avParams$sharedParams$gamma <- 0.8
+nn$exper$avParams$sharedParams$buffer <- 3000
+nn$exper$avParams$sharedParams$iters <- 150
+
+nn <- fullUpdateSLnn(nn, 1000, FALSE)
+time2 <- Sys.time()
+print(time2-time1)
+
+nn$exper$avParams$sharedParams$dL <- 0.9999
+nn$exper$avParams$sharedParams$dE <- 0.9999
+nn$exper$avParams$sharedParams$buffer <- 10000
+nn$exper$avParams$sharedParams$iters <- 50
+e1r$exper$avParams$sharedParams$rounds <- 200
+
+nn <- fullUpdateSLnn(nn, 500, FALSE)
+time3 <- Sys.time()
+print(time3-time2)
+
+saveRDS(nn, paste0("~/LocalDocs/TrafficCode/rcars20/extnumAV", numAVs, "typ", typ, "stFn", stFn, "rFn", rFn, ".rds"))
+#saveRDS(reg, paste0("./rcars20/ext", i))
+```
+
+# Experiments DL SL
+
+```{r}
+#buff <- readRDS("./buff.rds")
+sts <- list(stfG, stfGbG)
+rwrds <- list(rSp, rSpShare, rGap, rGapShare)
+
+stFn <- 1
+rFn <- 1
+numAVs <- 4
+typ <- 1
+
+rL <- 100
+nC <- 40
+AVs <- ((typ == 0)*c(sample(1:floor(nC/2), floor(numAVs/2)), sample(nC:ceiling((nC+1)/2), ceiling(numAVs/2))) + (typ == 1)*(c(1:(floor(numAVs/2)), nC:(nC + 1 - ceiling(numAVs/2))))) %>% sort
+
+res <- list()
+```
+
+```{r}
+e1n <- buildExperiment(roadLen = rL, lanes = 2, maxSpeed = list(rep(5, rL), rep(5, rL)),
+                       preference = list(rep(0, rL), rep(0, rL)),
+                       numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+  initAVDLF(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn1, qFn2, qFn2p),
+            actions = 0:5, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.1, nAVs = AVs, buffer = 200, replaceTarget = 20)
+
+time1 <- Sys.time()
+e1n <- fullUpdateDLnnF(e1n, iters = 1, new=TRUE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+time1 <- Sys.time()
+e1n <- fullUpdateDLnnF(e1n, iters = 399, new=FALSE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+e1n$exper$avParams$sharedParams$dL <- 0.998
+e1n$exper$avParams$sharedParams$dE <- 0.998
+e1n$exper$avParams$sharedParams$dG <- 1.0015
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateDLnnF(e1n, 299, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+```
+
+```{r}
+time1 <- Sys.time()
+e1nd <- buildExperiment(roadLen = rL, lanes = 2, maxSpeed = list(rep(5, rL), rep(5, rL)),
+                       preference = list(rep(0, rL), rep(0, rL)),
+                       numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+  initAVDL(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn1, qFn2, qFn2p),
+           actions = 0:5, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.1, nAVs = AVs, buffer = 200, replaceTarget = 20)
+
+time1 <- Sys.time()
+e1n <- fullUpdateDLnn(e1n, iters = 400, new=TRUE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+e1n$exper$avParams$sharedParams$dL <- 0.999
+e1n$exper$avParams$sharedParams$dE <- 0.999
+e1n$exper$avParams$sharedParams$dG <- 1.001
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 299, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- min(e1n$exper$avParams$sharedParams$buffer*2, nrow(e1n$exper$avParams$sharedTable$replayBuffer)/2)
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+e1n$exper$avParams$sharedParams$dL <- 1
+e1n$exper$avParams$sharedParams$dE <- 1
+e1n$exper$avParams$sharedParams$dG <- 1
+
+time2b <- Sys.time()
+#e1n <- fullUpdateSLnn(e1n, 1500, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+time1 <- Sys.time()
+#exp <- readRDS(paste0("./rcars20/", i))
+nn <- e1n
+
+nn$exper$avParams$sharedParams$dL <- 0.998
+nn$exper$avParams$sharedParams$dE <- 0.998
+nn$exper$avParams$sharedParams$gamma <- 0.8
+nn$exper$avParams$sharedParams$buffer <- 3000
+nn$exper$avParams$sharedParams$iters <- 150
+
+nn <- fullUpdateSLnn(nn, 1000, FALSE)
+time2 <- Sys.time()
+print(time2-time1)
+
+nn$exper$avParams$sharedParams$dL <- 0.9999
+nn$exper$avParams$sharedParams$dE <- 0.9999
+nn$exper$avParams$sharedParams$buffer <- 10000
+nn$exper$avParams$sharedParams$iters <- 50
+e1r$exper$avParams$sharedParams$rounds <- 200
+
+nn <- fullUpdateSLnn(nn, 500, FALSE)
+time3 <- Sys.time()
+print(time3-time2)
+
+saveRDS(nn, paste0("~/LocalDocs/TrafficCode/rcars20/extnumAV", numAVs, "typ", typ, "stFn", stFn, "rFn", rFn, ".rds"))
+#saveRDS(reg, paste0("./rcars20/ext", i))
+```
+
+# Conv
+
+```{r}
+fullUpdateSLnnC <- function(exper, iters, new = FALSE) {
+  if (new) {
+    exper <- fullUpdateSLShare(exper, 10, TRUE)
+    rStats <- exper$rStats
+    exper <- exper$exper
+    
+    exper$avParams$sharedTable$outputWeights <- keras_model_sequential()
+    exper$avParams$sharedTable$outputWeights %>% 
+      layer_embedding(input_dim = c(13), output_dim = )
+      layer_dense(units = 64, activation = 'relu', input_shape = c(13)) %>% 
+      layer_conv_1d(filters = 12, kernel_size = 3, activation = "relu") %>%
+      layer_max_pooling_1d(pool_size = 2) %>%
+      layer_conv_1d(filters = 12, kernel_size = 3, activation = "relu") %>%
+      
+      layer_dense(units = 64, activation = 'relu', input_shape = c(13)) %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 64, activation = 'relu') %>% 
+      layer_dropout(rate = 0.5) %>% 
+      layer_dense(units = 1, activation = 'linear') %>% 
+      compile(optimizer = 'adam', loss = 'mse')#, metrics = list('mae'))
+    
+    exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    exper$avParams$sharedTable$replayBuffer <- exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3))
+    ind <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer, replace=TRUE)
+    
+    exper$avParams$sharedTable$outputWeights %>% 
+      fit(matrix(unlist(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20)]), ncol=13),
+          matrix(exper$avParams$sharedTable$replayBuffer$vP[ind], ncol=1),
+          epochs = 10, batch_size = 32, view_metrics = FALSE, verbose = 0)
+    exper$avParams$sharedTable$targetWeights %>% 
+      fit(matrix(unlist(exper$avParams$sharedTable$replayBuffer[ind, c(18, 5, 7:9, 11:13, 15:17, 19, 20)]), ncol=13),
+          matrix(exper$avParams$sharedTable$replayBuffer$vP[ind], ncol=1),
+          epochs = 10, batch_size = 32, view_metrics = FALSE, verbose = 0)
+    
+    exper$avParams$sharedTable$replayBuffer <- sample_n(exper$avParams$sharedTable$replayBuffer %>% filter(!is.na(ngap3)), 250, replace=TRUE)
+  } else {
+    rStats <- exper$rStats
+    exper <- exper$exper
+  }
+  
+  for (i in 1:iters) {
+    if (i %% exper$avParams$sharedParams$iters == 1) {
+      print(i)
+      exper$avParams$sharedTable$targetWeights <- exper$avParams$sharedTable$outputWeights
+    }
+
+    pC <- exper$cars
+    exper <- exper %>% updateCarsSLnn %>% updateRoad
+    
+    #if (i %% 5 == 1) {
+      bufferInd <- sample(1:nrow(exper$avParams$sharedTable$replayBuffer), exper$avParams$sharedParams$buffer)
+      oldSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(18, 5, 7:9, 11:13, 15:17, 19, 20)]
+      newSt <- exper$avParams$sharedTable$replayBuffer[bufferInd, c(5, 6:8, 10:12, 14:16, 18, 19)]
+      rewardP <- exper$avParams$sharedTable$replayBuffer$rT[bufferInd]
+      
+      #Re-make Outputs on each iter
+      yt <- rewardP + exper$avParams$sharedParams$gamma * apply(do.call(cbind, lapply(0:5, function(sp) predict(exper$avParams$sharedTable$targetWeights, as.matrix(cbind(sp1 = pmin(sp, newSt$ngap-1), newSt))) %>% as.vector)), 1, max)
+      
+      exper$avParams$sharedTable$outputWeights %>% 
+        fit(matrix(unlist(oldSt), ncol=13), matrix(yt, ncol=1),
+            epochs = 10, batch_size = 32, view_metrics = FALSE, verbose = 0)
+    #}
+    
+    exper$avParams$sharedParams$alpha <- exper$avParams$sharedParams$alpha * exper$avParams$sharedParams$dL
+    exper$avParams$sharedParams$eps <- exper$avParams$sharedParams$eps * exper$avParams$sharedParams$dE
+    exper$avParams$sharedParams$gamma <- exper$avParams$sharedParams$gamma * exper$avParams$sharedParams$dG
+
+    rStats <- bind_rows(rStats, cbind(getStatsSL(exper$cars, min(exper$road$c$mSp, exper$road$c$len*exper$road$c$lanes/nrow(exper$cars))), exper$cars %>% left_join(pC, by="ID") %>% summarise(spDiff = sum(abs(speed.x-speed.y), na.rm = TRUE))))
+  }
+  
+  list(exper = exper, rStats = rStats)
+}
+```
+
+# Experiments SL
+
+## NN Experiment
+
+```{r}
+#buff <- readRDS("./buff.rds")
+sts <- list(stfG, stfGbG)
+rwrds <- list(rSp, rSpShare, rGap, rGapShare)
+
+stFn <- 1
+rFn <- 1
+numAVs <- 2
+typ <- 0
+
+rL <- 100
+nC <- 10
+AVs <- ((typ == 0)*sample(1:nC, numAVs) + (typ == 1)*1:numAVs) %>% sort
+
+res <- list()
+```
+
+```{r}
+time1 <- Sys.time()
+e1n <- buildExperiment(roadLen = rL, lanes = 1, maxSpeed = list(rep(5, rL)),
+                       preference = list(rep(0, rL)),
+                       numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+  initAVnn(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn1, qFn2, qFn2p),
+           actions = 0:5, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.1, nAVs = AVs, buffer = 200, replaceTarget = 20)
+
+time1 <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, iters = 400, new=TRUE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+e1n$exper$avParams$sharedParams$dL <- 0.999
+e1n$exper$avParams$sharedParams$dE <- 0.999
+e1n$exper$avParams$sharedParams$dG <- 1.001
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 299, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- e1n$exper$avParams$sharedParams$buffer + 20*numAVs
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1n <- fullUpdateSLnn(e1n, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1n$exper$avParams$sharedParams$iters <- e1n$exper$avParams$sharedParams$iters + 20
+e1n$exper$avParams$sharedParams$buffer <- min(e1n$exper$avParams$sharedParams$buffer*2, nrow(e1n$exper$avParams$sharedTable$replayBuffer)/2)
+e1n$exper$avParams$sharedParams$rounds <- e1n$exper$avParams$sharedParams$rounds + 10
+
+e1n$exper$avParams$sharedParams$dL <- 1
+e1n$exper$avParams$sharedParams$dE <- 1
+e1n$exper$avParams$sharedParams$dG <- 1
+
+time2b <- Sys.time()
+#e1n <- fullUpdateSLnn(e1n, 1500, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+time1 <- Sys.time()
+#exp <- readRDS(paste0("./rcars20/", i))
+nn <- e1n
+
+nn$exper$avParams$sharedParams$dL <- 0.998
+nn$exper$avParams$sharedParams$dE <- 0.998
+nn$exper$avParams$sharedParams$gamma <- 0.8
+nn$exper$avParams$sharedParams$buffer <- 3000
+nn$exper$avParams$sharedParams$iters <- 150
+
+nn <- fullUpdateSLnn(nn, 1000, FALSE)
+time2 <- Sys.time()
+print(time2-time1)
+
+nn$exper$avParams$sharedParams$dL <- 0.9999
+nn$exper$avParams$sharedParams$dE <- 0.9999
+nn$exper$avParams$sharedParams$buffer <- 10000
+nn$exper$avParams$sharedParams$iters <- 50
+e1r$exper$avParams$sharedParams$rounds <- 200
+
+nn <- fullUpdateSLnn(nn, 500, FALSE)
+time3 <- Sys.time()
+print(time3-time2)
+
+saveRDS(nn, paste0("~/LocalDocs/TrafficCode/rcars20/extnumAV", numAVs, "typ", typ, "stFn", stFn, "rFn", rFn, ".rds"))
+#saveRDS(reg, paste0("./rcars20/ext", i))
+```
+
+```{r}
+h2o.shutdown()
+```
+
+## XG Experiment
+
+```{r}
+#buff <- readRDS("./buff.rds")
+sts <- list(stfG, stfGbG)
+rwrds <- list(rSp, rSpShare, rGap, rGapShare)
+
+stFn <- 1
+rFn <- 1
+numAVs <- 5
+typ <- 0
+
+rL <- 200
+nC <- 40
+AVs <- ((typ == 0)*sample(1:nC, numAVs) + (typ == 1)*1:numAVs) %>% sort
+
+res <- list()
+```
+
+```{r}
+time1 <- Sys.time()
+e1x <- buildExperiment(roadLen = rL, lanes = 1, maxSpeed = list(rep(5, rL)),
+                       preference = list(rep(0, rL)),
+                       numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+  initAVxg(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn1, qFn2, qFn2p),
+            actions = 0:5, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.1, nAVs = AVs, buffer = 100, replaceTarget = 20, rounds = 50)
+
+e1x <- fullUpdateSLxg(e1x, iters = 400, new=TRUE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+e1x$exper$avParams$sharedParams$dL <- 0.999
+e1x$exper$avParams$sharedParams$dE <- 0.999
+e1x$exper$avParams$sharedParams$dG <- 1.001
+e1x$exper$avParams$sharedParams$iters <- e1x$exper$avParams$sharedParams$iters + 20
+e1x$exper$avParams$sharedParams$buffer <- e1x$exper$avParams$sharedParams$buffer + 20*numAVs
+e1x$exper$avParams$sharedParams$rounds <- e1x$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1x <- fullUpdateSLxg(e1x, 299, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1x$exper$avParams$sharedParams$iters <- e1x$exper$avParams$sharedParams$iters + 20
+e1x$exper$avParams$sharedParams$buffer <- e1x$exper$avParams$sharedParams$buffer + 20*numAVs
+e1x$exper$avParams$sharedParams$rounds <- e1x$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1x <- fullUpdateSLxg(e1x, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1x$exper$avParams$sharedParams$iters <- e1x$exper$avParams$sharedParams$iters + 20
+e1x$exper$avParams$sharedParams$buffer <- e1x$exper$avParams$sharedParams$buffer + 20*numAVs
+e1x$exper$avParams$sharedParams$rounds <- e1x$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1x <- fullUpdateSLxg(e1x, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1x$exper$avParams$sharedParams$iters <- e1x$exper$avParams$sharedParams$iters + 20
+e1x$exper$avParams$sharedParams$buffer <- e1x$exper$avParams$sharedParams$buffer + 20*numAVs
+e1x$exper$avParams$sharedParams$rounds <- e1x$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1x <- fullUpdateSLxg(e1x, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1x$exper$avParams$sharedParams$iters <- e1x$exper$avParams$sharedParams$iters + 20
+e1x$exper$avParams$sharedParams$buffer <- e1x$exper$avParams$sharedParams$buffer + 20*numAVs
+e1x$exper$avParams$sharedParams$rounds <- e1x$exper$avParams$sharedParams$rounds + 10
+
+time2b <- Sys.time()
+e1x <- fullUpdateSLxg(e1x, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1x$exper$avParams$sharedParams$iters <- e1x$exper$avParams$sharedParams$iters + 20
+e1x$exper$avParams$sharedParams$buffer <- min(e1x$exper$avParams$sharedParams$buffer*2, nrow(e1x$exper$avParams$sharedTable$replayBuffer)/2)
+e1x$exper$avParams$sharedParams$rounds <- e1x$exper$avParams$sharedParams$rounds + 10
+
+e1x$exper$avParams$sharedParams$dL <- 1
+e1x$exper$avParams$sharedParams$dE <- 1
+e1x$exper$avParams$sharedParams$dG <- 1
+
+time2b <- Sys.time()
+e1x <- fullUpdateSLxg(e1x, 1500, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+time2b <- Sys.time()
+e1x <- fullUpdateSLxg(e1x, 3000, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+time1 <- Sys.time()
+#exp <- readRDS(paste0("./rcars20/", i))
+xg <- e1x
+
+xg$exper$avParams$sharedParams$dL <- 0.998
+xg$exper$avParams$sharedParams$dE <- 0.998
+xg$exper$avParams$sharedParams$gamma <- 0.8
+xg$exper$avParams$sharedParams$buffer <- 3000
+xg$exper$avParams$sharedParams$iters <- 150
+
+xg <- fullUpdateSLxg(xg, 1000, FALSE)
+time2 <- Sys.time()
+print(time2-time1)
+
+xg$exper$avParams$sharedParams$dL <- 0.9999
+xg$exper$avParams$sharedParams$dE <- 0.9999
+xg$exper$avParams$sharedParams$buffer <- 10000
+xg$exper$avParams$sharedParams$iters <- 50
+e1r$exper$avParams$sharedParams$rounds <- 200
+
+xg <- fullUpdateSLxg(xg, 500, FALSE)
+time3 <- Sys.time()
+print(time3-time2)
+
+saveRDS(xg, paste0("~/LocalDocs/TrafficCode/rcars20/extnumAV", numAVs, "typ", typ, "stFn", stFn, "rFn", rFn, ".rds"))
+#saveRDS(reg, paste0("./rcars20/ext", i))
+```
+
+## Reg Experiment
+
+actions = actions, 
+dL 
+dE 
+dG 
+alpha 
+eps = eps, lambda = lambda, gamma = gamma, buffer = buffer, iters = replaceTarget, numAV = length(nAVs))
+
+```{r}
+#buff <- readRDS("./buff.rds")
+sts <- list(stfG, stfGSp, stfGHist, stfGbG, stShfG)
+rwrds <- list(rSp, rSpShare, rGap, rGapShare)
+
+stFn <- 1
+rFn <- 1
+numAVs <- 20
+typ <- 0
+
+rL <- 200
+nC <- 40
+AVs <- ((typ == 0)*sample(1:nC, numAVs) + (typ == 1)*1:numAVs) %>% sort
+
+res <- list()
+```
+
+```{r}
+time1 <- Sys.time()
+e1r <- buildExperiment(roadLen = rL, lanes = 1, maxSpeed = list(rep(5, rL)),
+                       preference = list(rep(0, rL)),
+                       numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+  initAVReg(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn1, qFn2, qFn2p),
+            actions = 0:5, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.1, nAVs = AVs, buffer = 200, replaceTarget = 20)
+
+#e1r <- fullUpdateSLReg(e1r, 1, new=TRUE, buildbuffer = FALSE, table=buff)
+
+e1r <- fullUpdateSLReg(e1r, 400, new=TRUE, buildbuffer = TRUE, table = NULL)
+time2 <- Sys.time()
+print(time2 - time1)
+
+e1r$exper$avParams$sharedParams$dL <- 0.999
+e1r$exper$avParams$sharedParams$dE <- 0.999
+e1r$exper$avParams$sharedParams$dG <- 1.001
+e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+e1r$exper$avParams$sharedParams$buffer <- e1r$exper$avParams$sharedParams$buffer + 200
+
+time2b <- Sys.time()
+e1r <- fullUpdateSLReg(e1r, 299, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+e1r$exper$avParams$sharedParams$buffer <- e1r$exper$avParams$sharedParams$buffer + 200
+
+time2b <- Sys.time()
+e1r <- fullUpdateSLReg(e1r, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+e1r$exper$avParams$sharedParams$buffer <- e1r$exper$avParams$sharedParams$buffer + 200
+
+time2b <- Sys.time()
+e1r <- fullUpdateSLReg(e1r, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+e1r$exper$avParams$sharedParams$buffer <- e1r$exper$avParams$sharedParams$buffer + 200
+
+time2b <- Sys.time()
+e1r <- fullUpdateSLReg(e1r, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+e1r$exper$avParams$sharedParams$buffer <- e1r$exper$avParams$sharedParams$buffer + 200
+
+time2b <- Sys.time()
+e1r <- fullUpdateSLReg(e1r, 300, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+e1r$exper$avParams$sharedParams$buffer <- min(e1r$exper$avParams$sharedParams$buffer*2, nrow(e1r$exper$avParams$sharedTable$replayBuffer)/2)
+
+e1r$exper$avParams$sharedParams$dL <- 1
+e1r$exper$avParams$sharedParams$dE <- 1
+e1r$exper$avParams$sharedParams$dG <- 1
+
+time2b <- Sys.time()
+e1r <- fullUpdateSLReg(e1r, 1500, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+time2b <- Sys.time()
+e1r <- fullUpdateSLReg(e1r, 3000, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2b)
+
+time1 <- Sys.time()
+#exp <- readRDS(paste0("./rcars20/", i))
+reg <- e1r
+
+reg$exper$avParams$sharedParams$dL <- 0.998
+reg$exper$avParams$sharedParams$dE <- 0.998
+reg$exper$avParams$sharedParams$gamma <- 0.8
+reg$exper$avParams$sharedParams$buffer <- 3000
+reg$exper$avParams$sharedParams$iters <- 150
+
+reg <- fullUpdateSLReg(reg, 1000, FALSE)
+time2 <- Sys.time()
+print(time2-time1)
+
+reg$exper$avParams$sharedParams$dL <- 0.9999
+reg$exper$avParams$sharedParams$dE <- 0.9999
+reg$exper$avParams$sharedParams$buffer <- 10000
+reg$exper$avParams$sharedParams$iters <- 50
+
+reg <- fullUpdateSLReg(reg, 500, FALSE)
+time3 <- Sys.time()
+print(time3-time2)
+
+saveRDS(res, paste0("~/LocalDocs/TrafficCode/rcars20/extnumAV", numAVs, "typ", typ, "stFn", stFn, "rFn", rFn, ".rds"))
+#saveRDS(reg, paste0("./rcars20/ext", i))
+```
+
+```{r}
+for (stFn in 2:1) {
+  for (numAVs in c(20)) {
+    for (typ in c(0, 1)) {
+      for (rFn in 4:1) {
+        res <- list()
+        AVs <- (typ == 0)*sample(1:nC, numAVs) + (typ == 1)*1:numAVs
+        
+        time1 <- Sys.time()
+        e1r <- buildExperiment(roadLen = rL, lanes = 1, maxSpeed = list(rep(5, rL)),
+                               preference = list(rep(0, rL)),
+                               numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+          initAVShare(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn1, qFn2, qFn2p),
+                      actions = 0:5, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.1, nAVs = AVs, buffer = 200, replaceTarget = 20)
+        
+        #e1r <- fullUpdateSLReg(e1r, 1, new=TRUE, buildbuffer = FALSE, table=buff)
+        print("hey")
+        
+        e1r <- fullUpdateSLReg(e1r, 400, new=TRUE, buildbuffer = TRUE, table = NULL)
+        time2 <- Sys.time()
+        print(time2 - time1)
+        
+        res[[1]] <- e1r
+        
+        e1r$exper$avParams$sharedParams$dL <- 0.999
+        e1r$exper$avParams$sharedParams$dE <- 0.999
+        e1r$exper$avParams$sharedParams$dG <- 1.001
+        e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+        e1r$exper$avParams$sharedParams$buffer <- e1r$exper$avParams$sharedParams$buffer + 200
+        
+        time2b <- Sys.time()
+        e1r <- fullUpdateSLReg(e1r, 299, new=FALSE)
+        time3 <- Sys.time()
+        print(time3 - time2b)
+        
+        res[[2]] <- e1r
+        e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+        e1r$exper$avParams$sharedParams$buffer <- e1r$exper$avParams$sharedParams$buffer + 200
+        
+        time2b <- Sys.time()
+        e1r <- fullUpdateSLReg(e1r, 300, new=FALSE)
+        time3 <- Sys.time()
+        print(time3 - time2b)
+        
+        res[[3]] <- e1r
+        e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+        e1r$exper$avParams$sharedParams$buffer <- e1r$exper$avParams$sharedParams$buffer + 200
+        
+        time2b <- Sys.time()
+        e1r <- fullUpdateSLReg(e1r, 300, new=FALSE)
+        time3 <- Sys.time()
+        print(time3 - time2b)
+        
+        res[[4]] <- e1r
+        e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+        e1r$exper$avParams$sharedParams$buffer <- e1r$exper$avParams$sharedParams$buffer + 200
+        
+        time2b <- Sys.time()
+        e1r <- fullUpdateSLReg(e1r, 300, new=FALSE)
+        time3 <- Sys.time()
+        print(time3 - time2b)
+        
+        res[[5]] <- e1r
+        e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+        e1r$exper$avParams$sharedParams$buffer <- e1r$exper$avParams$sharedParams$buffer + 200
+        
+        time2b <- Sys.time()
+        e1r <- fullUpdateSLReg(e1r, 300, new=FALSE)
+        time3 <- Sys.time()
+        print(time3 - time2b)
+        
+        res[[6]] <- e1r
+        e1r$exper$avParams$sharedParams$iters <- e1r$exper$avParams$sharedParams$iters + 20
+        e1r$exper$avParams$sharedParams$buffer <- min(e1r$exper$avParams$sharedParams$buffer*2, nrow(e1r$exper$avParams$sharedTable$replayBuffer)/2)
+        
+        e1r$exper$avParams$sharedParams$dL <- 1
+        e1r$exper$avParams$sharedParams$dE <- 1
+        e1r$exper$avParams$sharedParams$dG <- 1
+        
+        time2b <- Sys.time()
+        e1r <- fullUpdateSLReg(e1r, 1500, new=FALSE)
+        time3 <- Sys.time()
+        print(time3 - time2b)
+        
+        res[[7]] <- e1r
+        
+        time2b <- Sys.time()
+        e1r <- fullUpdateSLReg(e1r, 3000, new=FALSE)
+        time3 <- Sys.time()
+        print(time3 - time2b)
+        
+        res[[8]] <- e1r
+        
+        saveRDS(res, paste0("~/LocalDocs/TrafficCode/rcars20/numAV", numAVs, "typ", typ, "stFn", stFn, "rFn", rFn, ".rds"))
+      }
+    }
+  }
+}
+```
+
+```{r}
+fs <- list.files("~/LocalDocs/TrafficCode/rcars20/", pattern="^numAV.*")
+#i <- fs[1]
+for (i in fs) {
+  print(i)
+  time1 <- Sys.time()
+  exp <- readRDS(paste0("~/LocalDocs/TrafficCode/rcars20/", i))
+  reg <- exp[[8]]
+  
+  reg$exper$avParams$sharedParams$dL <- 0.998
+  reg$exper$avParams$sharedParams$dE <- 0.998
+  reg$exper$avParams$sharedParams$gamma <- 0.8
+  reg$exper$avParams$sharedParams$buffer <- 3000
+  reg$exper$avParams$sharedParams$iters <- 150
+  
+  reg <- fullUpdateSLReg(reg, 1000, FALSE)
+  time2 <- Sys.time()
+  print(time2-time1)
+  
+  reg$exper$avParams$sharedParams$dL <- 0.9999
+  reg$exper$avParams$sharedParams$dE <- 0.9999
+  reg$exper$avParams$sharedParams$buffer <- 10000
+  reg$exper$avParams$sharedParams$iters <- 50
+  
+  reg <- fullUpdateSLReg(reg, 500, FALSE)
+  time3 <- Sys.time()
+  print(time3-time2)
+  
+  saveRDS(reg, paste0("~/LocalDocs/TrafficCode/rcars20/ext", i))
+}
+```
+
+## Fully Shared Experiment
+
+```{r}
+sts <- list(stfG, stfGSp, stfGHist, stfGbG, stShfG)
+rwrds <- list(rSp, rSpShare, rSpGap, rSpGapShare, rGap, rGapShare, rTime, rTimePrev)
+
+stFn <- 1
+rFn <- 2
+
+rL <- 100
+nC <- 20
+AVs <- c(1:4)
+
+e1s <- buildExperiment(roadLen = rL, lanes = 1, maxSpeed = list(rep(5, rL)),
+                      preference = list(rep(0, rL)),
+                      numCars = nC, types = c(1, 1, 1), exitRate = 0, rpIter = 9999) %>% 
+  initAVShare(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn1, qFn2, qFn2p),
+         actions = 0:5, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.5, nAVs = AVs)
+
+time1 <- Sys.time()
+e1s <- fullUpdateSLShare(e1s, 500, new=TRUE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+e1s$exper$avParams$sharedParams$dL <- 0.998
+e1s$exper$avParams$sharedParams$dE <- 0.998
+e1s$exper$avParams$sharedParams$dG <- 0.998
+e1s$exper$avParams$sharedTable$iters <- 50
+
+e1s <- fullUpdateSLShare(e1s, 1299, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2)
+```
+
+## Ind Experiment 
+
+```
+sts <- list(stfG, stfGSp, stfGHist, stfGbG, stShfG)
+rwrds <- list(rSp, rSpShare, rSpGap, rSpGapShare, rGap, rGapShare, rTime, rTimePrev)
+
+stFn <- 1
+rFn <- 1
+
+rL <- 1000
+nC <- 200
+AVs <- sample(1:nC, 50)
+#AVs <- 1:50
+
+e1 <- buildExperiment(roadLen = rL, lanes = 1, maxSpeed = list(rep(5, rL)),
+                      preference = list(rep(0, rL)),
+                      numCars = nC, types = c(1, 0, 0), exitRate = 0, rpIter = 9999) %>% 
+  initAV(stFns = list(sts[[stFn]]), rFn = rwrds[[rFn]], qFns = list(qFn0, qFn1, qFn2, qFn2p, qFn3), actions = 0:5, def = 6, dL = 1, dE = 1, dG = 1, alpha=0.5, eps=0.5, lambda=0.5, gamma=0.5, nAVs = AVs)
+
+time1 <- Sys.time()
+e1 <- fullUpdateSL(e1, 500, new=TRUE)
+time2 <- Sys.time()
+print(time2 - time1)
+
+e1$exper$avParams$sharedParams$dL <- 0.998
+e1$exper$avParams$sharedParams$dE <- 0.998
+e1$exper$avParams$sharedParams$dG <- 0.998
+
+e1 <- fullUpdateSL(e1, 1299, new=FALSE)
+time3 <- Sys.time()
+print(time3 - time2)
+```
+
+```{r}
+#ggplot() + geom_line(aes(x=1:1800, y=e1$rStats$avgSp), colour = "brown")
+```
+
+## Rando
+
+```{r}
+model <- keras_model_sequential()
+
+model %>%
+  layer_dense(units=64, activation = 'relu') %>%
+  layer_dense(units=64, activation = 'relu') %>%
+  layer_dense(units=1, activation = 'linear')
+
+model %>% compile(
+  optimizer = 'adam',
+  loss = 'mse',           # mean squared error
+  metrics = list('mae')   # mean absolute error
+)
+
+data <- matrix(rnorm(1000 * 32), nrow = 1000, ncol = 32)
+labels <- matrix(rnorm(1000 * 10), nrow = 1000, ncol = 10)
+
+model %>% fit(
+  data,
+  labels,
+  epochs = 10,
+  batch_size = 32
+)
+```
+
